@@ -1,4 +1,4 @@
-from random import shuffle, random, choice
+from random import shuffle, random, choice, randrange
 import tensorflow as tf
 from tensorflow.keras.layers import LayerNormalization, Dropout, Dense
 
@@ -199,9 +199,9 @@ class BERTPretrain(tf.keras.layers.Layer):
 def create_pretrain_mask(tokens, mask_cnt, vocab_list):
     """
     Pretrain Data 생성 - [MASK] 토큰 생성
-    :param tokens: 문장을 토크나이저로 나눈 토큰 리스트
+    :param tokens: [CLS]+doc1+[SEP]+doc2+[SEP] 구조.  문장을 토크나이저로 나눈 토큰 리스트.
     :param mask_cnt: mask_cnt는 전체 token개수의 15%에 해당하는 개수.
-    :param vocab_list:
+    :param vocab_list: 단어집합리스트
     :return:
     """
     cand_idx = []
@@ -270,3 +270,82 @@ def trim_tokens(tokens_a, tokens_b, max_seq):
         else:
             tokens_b.pop()
 
+
+def create_pretrain_instances(docs, doc_idx, doc, n_seq, mask_prob, vocab_list):
+    """
+    * doc 별 pretrain 데이터 생성. 단락 최대 길이(n_seq) 만큼 재구성된 학습데이터를 만듦.
+    * 단락 구성 : [CLS]+doc1+[SEP]+doc2+[SEP]
+
+    학습데이터 구성방식
+        * is_next=0(다음문장이 실제문장이 아님)으로 구성되는 학습데이터는 tokens_a와 tokens_b 모두 길이를 랜덤선택하므로 학습데이터길이가 너무 짧아질수 있음
+        * tokens_a의 구성 문장길이가 짧으면 tokens_b에서 가능한 많이 채울수도 있을텐데 그러진 않음.
+    :param docs: 단락(문장) 모음
+    :param doc_idx: 현재 단락(문장)의 인덱스
+    :param doc: 현재 단락(문장)내용
+    :param n_seq: 단락(문장) 최대 길이
+    :param mask_prob: 문장 내 토큰에 [MASK] 토큰을 씌울 비중. 통상 0.15 즉 15%
+    :param vocab_list: 단어집합
+    :return:
+    """
+    # for [CLS], [SEP], [SEP]
+    max_seq = n_seq - 3
+    tgt_seq = max_seq
+
+    instances = []
+    current_chunk = []
+    current_length = 0
+    for i in range(len(doc)):
+        current_chunk.append(doc[i])  # line
+        current_length += len(doc[i])
+        # 마지막 단어이거나, 문장 길이가 문장 최대길이에 도달하면 문장을 스캔하여 학습데이터를 만듦.
+        if i == len(doc) - 1 or current_length >= tgt_seq:
+            if 0 < len(current_chunk):  # 현재문장 빈 값 예외처리
+                a_end = 1
+                # 단락에 구성된 단어가 한개 이상이라면 current_chunk에 있는 단어 중 하나의 인덱스 랜덤선택
+                if 1 < len(current_chunk):
+                    a_end = randrange(1, len(current_chunk))
+
+                tokens_a = []
+                for j in range(a_end):  # 처음단어부터 랜덤 선택된 인덱스의 단어까지 모두 tokens_a에 추가.
+                    tokens_a.extend(current_chunk[j])
+
+                tokens_b = []
+                # 단어가 한개밖에 없거나 (똑같은 단어를 두개 쓸수는 없으므로), 50프로의 확률로 다른단락(문장)에서 tokens_b 생성.
+                if len(current_chunk) == 1 or random() < 0.5:
+                    is_next = 0  # False (다음문장이 실제 문장이 아님)
+
+                    # trim_tokens 메소드를 사용하면 되므로 필요없음
+                    # tokens_b_len = tgt_seq - len(tokens_a)
+
+                    random_doc_idx = doc_idx
+                    # 다른 단락 랜덤선택
+                    while doc_idx == random_doc_idx:
+                        random_doc_idx = randrange(0, len(docs))
+                    random_doc = docs[random_doc_idx]
+
+                    # 꼭 최대 단락길이를 다 채울필요는 없고, 나중에 최대단락길이만 넘지 않으면 됨.
+                    random_start = randrange(0, len(random_doc))  # 다른단락에서 랜덤으로 시작단어 인덱스 get
+                    for j in range(random_start, len(random_doc)):  # 랜덤선택한 단어부터 끝까지 tokens_b에 추가.
+                        tokens_b.extend(random_doc[j])
+
+                else:  # 50프로의 확률로 동일한 단락에서 tokens_b 생성.
+                    is_next = 1  # True (다음문장이 실제 문장임)
+                    for j in range(a_end, len(current_chunk)):
+                        tokens_b.extend(current_chunk[j])
+
+                # tokens_a의 단락 길이가 더 길면 a의 "앞쪽"부터 단어제거
+                # tokens_b의 단락 길이가 더 길면 b의 "뒤쪽"부터 단어제거
+                trim_tokens(tokens_a, tokens_b, max_seq)
+                assert 0 < len(tokens_a)
+                assert 0 < len(tokens_b)
+
+                tokens = ["[CLS]"] + tokens_a + ["[SEP]"] + tokens_b + ["[SEP]"]
+
+                # len(tokens_a) + 2 : [CLS]와 [SEP] 포함
+                # len(tokens_b) + 1 : [SEP] 포함
+                # 앞쪽 단락은 0으로 segment 지정, 뒤쪽 단락은 1로 segment 지정
+                segment = [0] * (len(tokens_a) + 2) + [1] * (len(tokens_b) + 1)
+
+                # Mask Token 개수는 전체 Token수([CLS],[SEP],[SEP]은 제외) 에 mask_prob(통상 0.15 즉, 15%)를 곱하여 구함.
+                tokens, mask_idx, mask_label = create_pretrain_mask(tokens, int((len(tokens) - 3) * mask_prob),
+                                                                    vocab_list)

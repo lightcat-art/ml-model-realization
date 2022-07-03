@@ -1,7 +1,11 @@
-# 웹 크롤러 (web-crawler)
-딥러닝에 필요한 데이터를 인터넷에서 크롤링하기 위한 기능들을 모음 입니다.
+# 한국어 위키 말뭉치 생성
 
-원본 깃 레포지토리 : https://github.com/paul-hyun/web-crawler
+원본 깃 레포지토리 : 
+<br>https://github.com/paul-hyun/web-crawler
+<br>https://github.com/google/sentencepiece
+
+참고 블로그 : 
+<br>https://paul-hyun.github.io/vocab-with-sentencepiece/
 
 ## 환경
 * Python(>=3.6)

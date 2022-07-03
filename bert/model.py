@@ -1,6 +1,21 @@
+import json
+import os
+from abc import ABC
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
 from tensorflow.keras.layers import LayerNormalization, Dropout, Dense
+import sentencepiece as spm
+from tqdm import tqdm
+
+
+def load_vocab():
+    vocab_file = "../kowiki/kowiki.model"
+    vocab = spm.SentencePieceProcessor()
+    vocab.load(vocab_file)
+    return vocab
+
+
+vocab = load_vocab()
 
 
 def get_attn_pad_mask(self, seq_q, seq_k, i_pad):
@@ -133,7 +148,7 @@ class Encoder(tf.keras.layers.Layer):
         for i in range(self.config.n_layer):
             # (batch_size, n_enc_seq, embedding_dim), (batch_size, num_heads, n_enc_seq, n_enc_seq)
             outputs, attn_prob = EncoderLayer(self.config)(outputs, attn_mask, training=True)
-            attn_prob.append(attn_prob)
+            attn_probs.append(attn_prob)
 
         return outputs, attn_probs
 
@@ -276,6 +291,9 @@ def create_pretrain_instances(docs, doc_idx, doc, n_seq, mask_prob, vocab_list):
     * doc 별 pretrain 데이터 생성. 단락 최대 길이(n_seq) 만큼 재구성된 학습데이터를 만듦.
     * 단락 구성 : [CLS]+doc1+[SEP]+doc2+[SEP]
 
+    * doc이라는 단락에는 문장단위로 다시 쪼개진다는 구분이 없고, 단지 단락이 단어토큰의 집합으로 이루어져있음. 즉 문장과 동일하게 인식.
+    * 따라서 단락내 특정문장의 중간부터, 다음문장의 중간까지의 텍스트가  tokens_a 나 tokens_b로 구성될수 있음을 인식.
+
     학습데이터 구성방식
         * is_next=0(다음문장이 실제문장이 아님)으로 구성되는 학습데이터는 tokens_a와 tokens_b 모두 길이를 랜덤선택하므로 학습데이터길이가 너무 짧아질수 있음
         * tokens_a의 구성 문장길이가 짧으면 tokens_b에서 가능한 많이 채울수도 있을텐데 그러진 않음.
@@ -283,7 +301,7 @@ def create_pretrain_instances(docs, doc_idx, doc, n_seq, mask_prob, vocab_list):
     :param doc_idx: 현재 단락(문장)의 인덱스
     :param doc: 현재 단락(문장)내용
     :param n_seq: 단락(문장) 최대 길이
-    :param mask_prob: 문장 내 토큰에 [MASK] 토큰을 씌울 비중. 통상 0.15 즉 15%
+    :param mask_prob: 단락(문장) 내 토큰에 [MASK] 토큰을 씌울 비중. 통상 0.15 즉 15%
     :param vocab_list: 단어집합
     :return:
     """
@@ -297,7 +315,7 @@ def create_pretrain_instances(docs, doc_idx, doc, n_seq, mask_prob, vocab_list):
     for i in range(len(doc)):
         current_chunk.append(doc[i])  # line
         current_length += len(doc[i])
-        # 마지막 단어이거나, 문장 길이가 문장 최대길이에 도달하면 문장을 스캔하여 학습데이터를 만듦.
+        # 마지막 단어이거나, 단락(문장) 길이가 문장 최대길이에 도달하면 단락(문장)을 스캔하여 학습데이터를 만듦.
         if i == len(doc) - 1 or current_length >= tgt_seq:
             if 0 < len(current_chunk):  # 현재문장 빈 값 예외처리
                 a_end = 1
@@ -349,3 +367,113 @@ def create_pretrain_instances(docs, doc_idx, doc, n_seq, mask_prob, vocab_list):
                 # Mask Token 개수는 전체 Token수([CLS],[SEP],[SEP]은 제외) 에 mask_prob(통상 0.15 즉, 15%)를 곱하여 구함.
                 tokens, mask_idx, mask_label = create_pretrain_mask(tokens, int((len(tokens) - 3) * mask_prob),
                                                                     vocab_list)
+                # 단락(문장)별 학습데이터 더미 생성.
+                instance = {
+                    "tokens": tokens,
+                    "segment": segment,  # segment label
+                    "is_next": is_next,  # NSP label
+                    "mask_idx": mask_idx,  # mask된 토큰의 단락(문장) 내 인덱스
+                    "mask_label": mask_label  # mask된 토큰의 정답값
+                }
+                instances.append(instance)
+
+            # 변수 초기화
+            current_chunk = []
+            current_length = 0
+    return instances
+
+
+def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob):
+    """
+    pretrain 데이터 생성
+    :param vocab:
+    :param in_file:
+    :param out_file:
+    :param count:
+    :param n_seq:
+    :param mask_prob:
+    :return:
+    """
+    vocab_list = []
+    # 단어목록 vocab_list를 생성. 생성 시 unknown은 제거
+    # vocab_list는 create_pretrain_mask 함수의 입력으로 사용.
+    for id in range(vocab.get_piece_size()):
+        if not vocab.is_unknown(id):
+            vocab_list.append(vocab.id_to_piece(id))
+
+    # 말뭉치 파일 라인수를 확인.
+    line_cnt = 0
+    with open(in_file, 'r', encoding='utf-8') as in_f:
+        for line in in_f:
+            line_cnt += 1
+
+    docs = []
+    with open(in_file, 'r', encoding='utf-8') as f:
+        doc = []
+        with tqdm(total=line_cnt, desc=f"Loading") as pbar:  # 진행률 표시
+            for i, line in enumerate(f):
+                line = line.strip()
+                if line == "":  # 줄에 빈값이라면 단락이 종료된것으로 인식. doc를 docs에 추가하고 doc를 새로 만듭니다.
+                    if 0 < len(doc):
+                        docs.appned(doc)
+                        doc = []
+                else:
+                    # 줄에 구성된 문자를 vocab을 이용해 tokenize한 후 doc에 추가.
+                    pieces = vocab.encode_as_pieces(line)
+                    if 0 < len(pieces):
+                        doc.append(pieces)
+                pbar.update(1)
+            if doc:
+                docs.append(doc)
+
+        # BERT는 Mask를 15%만 하므로 MLM을 학습시에 한번에 전체 단어를 학습할수 없음.
+        # 한 말뭉치에 대해 통상 Pretrain 데이터 10개(count로 설정가능) 정도 만들어서 학습하도록 함.
+        for index in range(count):
+            output = out_file.format(index)
+            if os.path.isfile(output): continue
+
+            with open(output, 'w') as out_f:
+                with tqdm(total=len(docs), desc=f"Masing") as pbar:
+                    # 단락모음을 돌면서 모든 단락에 대해 Pretrain data를 생성하여 하나의 파일에 쓰기.
+                    for i, doc in enumerate(docs):
+                        # doc은 encode된 토큰(토큰의 인덱스가 아닌 토큰단어)으로 이루어짐.
+                        instances = create_pretrain_instances(docs, i, doc, n_seq, mask_prob, vocab_list)
+                        for instance in instances:
+                            out_f.write(json.dumps(instance))
+                            out_f.write("\n")
+                        pbar.update(1)
+
+
+def wrapper_make_pretrain_data():
+    in_file = "../kowiki-data/kowiki.txt"
+    out_file = "../kowiki-data/kowiki_bert_{}.json"
+    count = 10
+    # kowiki 학습데이터를 살펴보니 단락이 꽤나 길어서 256개로는 데이터 뒷부분을 제대로 활용하기 힘들수도 있지만... 일단 적용
+    n_seq = 256  # 단락(문장) 최대길이.
+    mask_prob = 0.15
+
+    make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob)
+
+
+"""
+TODO:
+tensorflow 기준
+1. train을 하려면 Layer에 정의된 output에 정답데이터가 들어가야하는데, attn_probs에 대한 정답값은 넣을수 없다. 
+    -> output인자 attn_probs 빼고 재구성해야함.
+2. DataSet에서 tensor_from_slices 이용할때 {'inputs': xx , 'segments' : xx}, {'logits_cls' : xx , 'logits_lm' : xx} 로 구성하기.
+
+"""
+class PretrainDataSet(tf.data.Dataset):
+    def __init__(self, vocab, in_file):
+        super(PretrainDataSet, self).__init__()
+
+        self.vocab = vocab
+        self.labels_cls = []
+        self.labels_lm = []
+        self.sentences = []
+        self.segments = []
+        # TODO : 데이터 세팅
+
+    def from_tensor_slices(self):
+        super().from_tensor_slices(({'inputs': self.sentences, 'segments': self.segments},
+                                    {'logits_cls': self.labels_cls, 'logits_lm': self.labels_lm}))

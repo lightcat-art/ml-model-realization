@@ -1,11 +1,19 @@
 import json
 import os
-from abc import ABC
+import sys
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
-from tensorflow.keras.layers import LayerNormalization, Dropout, Dense
+from keras.losses import SparseCategoricalCrossentropy
+from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Input
 import sentencepiece as spm
 from tqdm import tqdm
+import numpy as np
+
+from config import Config
+
+sys.setrecursionlimit(100000)
+
+execType = "TEST"
 
 
 def load_vocab():
@@ -18,7 +26,7 @@ def load_vocab():
 vocab = load_vocab()
 
 
-def get_attn_pad_mask(self, seq_q, seq_k, i_pad):
+def get_attn_pad_mask(seq_q, seq_k, i_pad):
     # seq_q : (batch_size, len_q)
     # seq_k : (batch_size, len_k)
     batch_size = tf.shape(seq_q)[0]
@@ -35,10 +43,11 @@ def get_attn_pad_mask(self, seq_q, seq_k, i_pad):
 
 
 class MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, embedding_dim, num_heads=8):
+    def __init__(self, embedding_dim, n_enc_seq, num_heads=8, ):
         super(MultiHeadAttention, self).__init__()
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
+        self.n_enc_seq = n_enc_seq
 
         assert embedding_dim % self.num_heads == 0
 
@@ -49,14 +58,24 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         self.dense = tf.keras.layers.Dense(embedding_dim)
 
     def scaled_dot_product_attention(self, query, key, value, mask):
+        # print('scaled_dot_product_attention : query = {}'.format(query))
+        # print('scaled_dot_product_attention : key = {}'.format(key))
+        # print('scaled_dot_product_attention : value = {}'.format(value))
         matmul_qk = tf.matmul(query, key, transpose_b=True)
         depth = tf.cast(tf.shape(key)[-1], tf.float32)  # Head의 projection_dim
+        batch_size = tf.cast(tf.shape(key)[0], tf.float32)  # Head의 projection_dim
         logits = matmul_qk / tf.math.sqrt(depth)
 
         # 마스킹. 에턴션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
         # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 됨.
-        if mask is not None:
-            logits += (mask * -1e9)
+        mask = tf.broadcast_to(tf.expand_dims(mask, axis=1), [batch_size, self.num_heads, self.n_enc_seq, self.n_enc_seq])
+        print('scaled_dot_product_attention : logits shape = {}'.format(tf.shape(logits)))
+        print('scaled_dot_product_attention : mask shape = {}'.format(tf.shape(mask)))
+
+        # if mask is not None:
+        #     logits += (mask * -1e9)
+        # 패딩마스크를 logits 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 -1e9으로 업데이트)
+        logits = tf.where(mask, -1e9, logits)
 
         attention_weights = tf.nn.softmax(logits, axis=-1)
 
@@ -69,6 +88,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         return tf.transpose(x, perm=[0, 2, 1, 3])
 
     def call(self, inputs, mask):
+        # print('MultiHeadAttention : input = {}'.format(inputs))
         # x.shape = [batch_size, seq_len, embedding_dim]
         batch_size = tf.shape(inputs)[0]
 
@@ -77,10 +97,18 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         key = self.key_dense(inputs)
         value = self.value_dense(inputs)
 
+        print('MultiHeadAttention : query = {}'.format(tf.shape(query)))
+        print('MultiHeadAttention : key = {}'.format(tf.shape(key)))
+        print('MultiHeadAttention : value = {}'.format(tf.shape(value)))
+
         # (batch_size, num_heads, seq_len, projection_dim)
         query = self.split_heads(query, batch_size)
         key = self.split_heads(key, batch_size)
         value = self.split_heads(value, batch_size)
+
+        print('MultiHeadAttention : query after split head = {}'.format(tf.shape(query)))
+        print('MultiHeadAttention : key after split head = {}'.format(tf.shape(key)))
+        print('MultiHeadAttention : value after split head = {}'.format(tf.shape(value)))
 
         scaled_attention, attn_prob = self.scaled_dot_product_attention(query, key, value, mask)
 
@@ -91,7 +119,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         concat_attention = tf.reshape(scaled_attention, (batch_size, -1, self.embedding_dim))
 
         outputs = self.dense(concat_attention)
-        return outputs, attn_prob
+        return outputs
 
 
 class EncoderLayer(tf.keras.layers.Layer):
@@ -99,7 +127,7 @@ class EncoderLayer(tf.keras.layers.Layer):
         super(EncoderLayer, self).__init__()
         self.config = config
 
-        self.att = MultiHeadAttention(self.config.d_model, self.config.num_heads)
+        self.att = MultiHeadAttention(self.config.embedding_dim,  self.config.n_enc_seq, self.config.num_heads)
         self.ffn = tf.keras.Sequential(
             [tf.keras.layers.Dense(self.config.dff, activation="relu"),
              tf.keras.layers.Dense(self.config.embedding_dim)]
@@ -110,28 +138,34 @@ class EncoderLayer(tf.keras.layers.Layer):
         self.dropout2 = Dropout(self.config.dropout)
 
     def call(self, inputs, mask, training):
-        attn_output, attn_prob = self.att(inputs, mask)  # 첫번째 서브층 : 멀티 헤드 어텐션
+        attn_output = self.att(inputs, mask)  # 첫번째 서브층 : 멀티 헤드 어텐션
         # training 옵션 : 학습시에만 적용되고 추론시에는 적용되지 않도록 하는 옵션
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(inputs + attn_output)  # Add & norm
         ffn_output = self.ffn(out1)  # 두번째 서브층 : 포지션 와이즈 피드 포워드 신경망
         ffn_output = self.dropout2(ffn_output, training=training)
-        return self.layernorm2(out1 + ffn_output), attn_prob  # Add & norm
+        return self.layernorm2(out1 + ffn_output)  # Add & norm
 
 
 class Encoder(tf.keras.layers.Layer):
     def __init__(self, config):
         super(Encoder, self).__init__()
         self.config = config
-
+        # with tf.variable_creator_scope('scope1'):
         self.enc_emb = tf.keras.layers.Embedding(self.config.n_enc_vocab, self.config.embedding_dim)
         # n_enc_seq에 +1 하는 이유가??
         self.pos_emb = tf.keras.layers.Embedding(self.config.n_enc_seq + 1, self.config.embedding_dim)
         self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim)
 
     def call(self, inputs, segments):
+        print('Encoder : inputs = {}'.format(inputs))
         # 포지션 임베딩 inputs 생성 (크기는 inputs의 seq_length와 동일)
-        positions = tf.keras.layers.Input(shape=(None, self.config.n_enc_seq), name="positions")
+        if execType == "TEST":
+            positions = tf.random.uniform(shape=(100, self.config.n_enc_seq), minval=1, maxval=self.config.n_enc_seq,
+                                          dtype=tf.dtypes.int32)
+        elif execType == "LEARN":
+            positions = tf.keras.layers.Input(shape=(None, self.config.n_enc_seq), name="positions",
+                                              dtype=tf.dtypes.int32)
         # i_pad (패딩으로 간주되는 토큰의 정수) 와 inputs를 비교하여 패딩마스크 생성 -> 패딩토큰:True, 단어토큰:False 으로 구성된 패딩마스크 생성
         pos_mask = tf.equal(inputs, self.config.i_pad)
         # 패딩마스크를 positions 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 0으로 업데이트)
@@ -141,16 +175,16 @@ class Encoder(tf.keras.layers.Layer):
         outputs = self.enc_emb(inputs) + self.pos_emb(positions) + self.seg_emb(segments)
 
         # (batch_size, n_enc_seq, n_enc_seq)
-        attn_mask = get_attn_pad_mask(inputs, inputs, self.config.i_pad)
+        attn_mask = get_attn_pad_mask(seq_q=inputs, seq_k=inputs, i_pad=self.config.i_pad)
 
         attn_probs = []
 
         for i in range(self.config.n_layer):
             # (batch_size, n_enc_seq, embedding_dim), (batch_size, num_heads, n_enc_seq, n_enc_seq)
-            outputs, attn_prob = EncoderLayer(self.config)(outputs, attn_mask, training=True)
-            attn_probs.append(attn_prob)
+            outputs = EncoderLayer(self.config)(outputs, attn_mask, training=True)
+            # attn_probs.append(attn_prob)
 
-        return outputs, attn_probs
+        return outputs
 
 
 class BERT(tf.keras.layers.Layer):
@@ -167,7 +201,7 @@ class BERT(tf.keras.layers.Layer):
     def call(self, inputs, segments):
         # outputs : (batch_size, n_seq, embedding_dim)
         # self_attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
-        outputs, self_attn_probs = self.encoder(inputs, segments)
+        outputs = self.encoder(inputs, segments)
 
         # (batch_size, embedding_dim)
         # 첫번째([CLS]) Token을 저장.
@@ -176,7 +210,7 @@ class BERT(tf.keras.layers.Layer):
         # outputs_cls에 Dense 및 tanh activation 통과.
         outputs_cls = self.dense(outputs_cls)
 
-        return outputs, outputs_cls, self_attn_probs
+        return outputs, outputs_cls
 
 
 class BERTPretrain(tf.keras.layers.Layer):
@@ -188,16 +222,18 @@ class BERTPretrain(tf.keras.layers.Layer):
         # NSP(Next Sentence Prediction) Classifier
         self.projection_cls = Dense(units=2)
         # MLM(Masked Language Model) classifier
-        self.projection_lm = Dense(units=self.config.n_enc_vocab)
+
         # 왜 MLM weight를 enc_emb weight 와 share하는것인지?
-        # 초기 weight를 share하는것인지?
-        self.projection_lm.weights = self.bert.encoder.enc_emb.weights
+        # enc_emb 층과 weight share
+        # with tf.variable_creator_scope('scope1', reuse=True):
+        self.projection_lm = Dense(units=self.config.n_enc_vocab)
 
     def call(self, inputs, segments):
+        print('BERTPretrain : inputs = {}'.format(inputs))
         # outputs : (batch_size, n_enc_seq, embedding_dim)
         # outputs_cls : (batch_size, embedding_dim)
         # attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
-        outputs, outputs_cls, attn_probs = self.bert(inputs, segments)
+        outputs, outputs_cls = self.bert(inputs, segments)
 
         # (batch_size, 2)
         # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
@@ -208,7 +244,7 @@ class BERTPretrain(tf.keras.layers.Layer):
         # MLM 예측
         logits_lm = self.projection_lm(outputs)
 
-        return logits_cls, logits_lm, attn_probs
+        return logits_cls, logits_lm
 
 
 def create_pretrain_mask(tokens, mask_cnt, vocab_list):
@@ -383,7 +419,7 @@ def create_pretrain_instances(docs, doc_idx, doc, n_seq, mask_prob, vocab_list):
     return instances
 
 
-def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob):
+def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_line_cnt=-1):
     """
     pretrain 데이터 생성
     :param vocab:
@@ -394,6 +430,7 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob):
     :param mask_prob:
     :return:
     """
+    print("make_pretrain_data start")
     vocab_list = []
     # 단어목록 vocab_list를 생성. 생성 시 unknown은 제거
     # vocab_list는 create_pretrain_mask 함수의 입력으로 사용.
@@ -405,17 +442,22 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob):
     line_cnt = 0
     with open(in_file, 'r', encoding='utf-8') as in_f:
         for line in in_f:
+            if max_line_cnt < line_cnt:
+                break
             line_cnt += 1
+    print("make_pretrain_data line cnt = {}".format(line_cnt))
 
     docs = []
     with open(in_file, 'r', encoding='utf-8') as f:
         doc = []
         with tqdm(total=line_cnt, desc=f"Loading") as pbar:  # 진행률 표시
             for i, line in enumerate(f):
+                if i > line_cnt:
+                    break
                 line = line.strip()
                 if line == "":  # 줄에 빈값이라면 단락이 종료된것으로 인식. doc를 docs에 추가하고 doc를 새로 만듭니다.
                     if 0 < len(doc):
-                        docs.appned(doc)
+                        docs.append(doc)
                         doc = []
                 else:
                     # 줄에 구성된 문자를 vocab을 이용해 tokenize한 후 doc에 추가.
@@ -433,7 +475,7 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob):
             if os.path.isfile(output): continue
 
             with open(output, 'w') as out_f:
-                with tqdm(total=len(docs), desc=f"Masing") as pbar:
+                with tqdm(total=len(docs), desc=f"Masking") as pbar:
                     # 단락모음을 돌면서 모든 단락에 대해 Pretrain data를 생성하여 하나의 파일에 쓰기.
                     for i, doc in enumerate(docs):
                         # doc은 encode된 토큰(토큰의 인덱스가 아닌 토큰단어)으로 이루어짐.
@@ -445,35 +487,152 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob):
 
 
 def wrapper_make_pretrain_data():
+    print("wrapper_make_pretrain_data start")
     in_file = "../kowiki-data/kowiki.txt"
     out_file = "../kowiki-data/kowiki_bert_{}.json"
     count = 10
     # kowiki 학습데이터를 살펴보니 단락이 꽤나 길어서 256개로는 데이터 뒷부분을 제대로 활용하기 힘들수도 있지만... 일단 적용
     n_seq = 256  # 단락(문장) 최대길이.
     mask_prob = 0.15
+    make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_line_cnt=1000)
 
-    make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob)
+
+def makeDataset(vocab, in_file):
+    """
+    TODO:
+    tensorflow 기준
+    1. train을 하려면 Layer에 정의된 output에 정답데이터가 들어가야하는데, attn_probs에 대한 정답값은 넣을수 없다.
+        -> Model 구성할때 output인자에 attn_probs 빼도록 재구성해야함.
+    2. DataSet에서 tensor_from_slices 이용할때 {'inputs': xx , 'segments' : xx}, {'logits_cls' : xx , 'logits_lm' : xx} 로 구성하기.
+    """
+    print("makeDataset start")
+    vocab = vocab
+    labels_cls = []
+    labels_lm = []
+    sentences = []
+    segments = []
+    line_cnt = 0
+    print("read file start")
+    for i in range(10):
+        in_file_format = in_file.format(i)
+        with open(in_file_format, 'r') as f:
+            for line in f:
+                line_cnt += 1
+
+        with open(in_file_format, 'r') as f:
+
+            for j, line in enumerate(tqdm(f, total=line_cnt, desc=f"Loading {in_file_format}", unit=" lines")):
+                instance = json.loads(line)
+                labels_cls.append(instance["is_next"])  # tokens_a와 tokens_b가 인접한 문장인지 여부
+                sentence = [vocab.piece_to_id(p) for p in instance["tokens"]]  # 문장 tokens
+                sentences.append(sentence)
+                segments.append(instance["segment"])  # tokens_a(0)과 tokens_b(1)을 구분하기 위한 값
+                mask_idx = np.array(instance["mask_idx"], dtype=np.int)  # tokens 내 mask index
+                # tokens 내 mask된 부분의 정답
+                mask_label = np.array([vocab.piece_to_id(p) for p in instance["mask_label"]], dtype=np.int)
+                label_lm = np.full(len(sentence), dtype=np.int, fill_value=-1)
+                label_lm[mask_idx] = mask_label
+                labels_lm.append(label_lm)
+        line_cnt = 0
+    print("read file end. size : sentences = {}, segments = {}, labels_cls = {}, labels_lm = {}".format(
+        len(sentences), len(segments), len(labels_cls), len(labels_lm)))
+    # print("sentences : {}".format(sentences))
+    # print("segments : {}".format(segments))
+    # print("labels_cls : {}".format(labels_cls))
+    # print("labels_lm : {}".format(labels_lm))
+
+    sentences = tf.ragged.constant(sentences)
+    segments = tf.ragged.constant(segments)
+    labels_cls = tf.ragged.constant(labels_cls)
+    labels_lm = tf.ragged.constant(labels_lm)
+    dataset = tf.data.Dataset.from_tensor_slices(({'inputs': sentences, 'segments': segments},
+                                                  {'labels_cls': labels_cls, 'labels_lm': labels_lm}))
+
+    print("makeDataset end")
+    return dataset
 
 
-"""
-TODO:
-tensorflow 기준
-1. train을 하려면 Layer에 정의된 output에 정답데이터가 들어가야하는데, attn_probs에 대한 정답값은 넣을수 없다. 
-    -> output인자 attn_probs 빼고 재구성해야함.
-2. DataSet에서 tensor_from_slices 이용할때 {'inputs': xx , 'segments' : xx}, {'logits_cls' : xx , 'logits_lm' : xx} 로 구성하기.
+def makeModel(type="LEARN"):
+    """
+    TODO:
+    1. DataSet에서 batch 만들기.
+    2. DataSet에서 inputs의 길이가 같아지도록 짧은 문장에 padding(0)을 추가해야함.
+    3. DataSet에서 segments의 길이가 같아지도록 짧은 문장에 padding(0)을 추가해야함.
 
-"""
-class PretrainDataSet(tf.data.Dataset):
-    def __init__(self, vocab, in_file):
-        super(PretrainDataSet, self).__init__()
+    4. inputs, segments를 입력으로 하여 BERTPretrain 실행
+    5. 나온 결과값인 logits_cls, logits_lm 값을 가지고  labels_cls, labels_lm 와 loss 계산
+    6. loss_cls + loss_lm = loss_total
+    7. loss, optimizer를 이용해 학습진행
 
-        self.vocab = vocab
-        self.labels_cls = []
-        self.labels_lm = []
-        self.sentences = []
-        self.segments = []
-        # TODO : 데이터 세팅
+    4. DataSet에서 from_tensor_slices를 이용하여 데이터 세팅.
+    """
+    config = Config.load("config.json")
+    filepath = "../kowiki-data/kowiki_bert_{}.json"
+    dataset = makeDataset(vocab, filepath)
 
-    def from_tensor_slices(self):
-        super().from_tensor_slices(({'inputs': self.sentences, 'segments': self.segments},
-                                    {'logits_cls': self.labels_cls, 'logits_lm': self.labels_lm}))
+    inputs = None
+    segments = None
+    if type == "TEST":
+        print("makeModel : make instant input for forward pass")
+        inputs = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1, maxval=vocab.vocab_size(),
+                                   dtype=tf.dtypes.int32)
+        segments = tf.random.uniform(shape=(100, config.n_enc_seq), minval=0, maxval=1,
+                                     dtype=tf.dtypes.int32)
+        # inputs = tf.constant(shape=(100, config.n_enc_seq), name="inputs")
+        # segments = tf.constant(shape=(100, config.n_enc_seq), name="segments")
+    elif type == "LEARN":
+        print("makeModel : make tensor input for learn")
+        inputs = Input(shape=(None, config.n_enc_seq), name="inputs")
+        segments = Input(shape=(None, config.n_enc_seq), name="segments")
+    bert_layer = BERTPretrain(config)
+    logits_cls, logits_lm = bert_layer(inputs, segments)
+    model = CustomModel(inputs=[inputs, segments], outputs=[logits_cls, logits_lm])
+    return dataset, model
+
+
+def learn(model, dataset):
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    model.fit(dataset, epochs=1)
+
+
+class CustomModel(tf.keras.Model):
+    """
+    https://www.tensorflow.org/guide/keras/customizing_what_happens_in_fit?hl=ko
+    """
+
+    def train_step(self, data):
+        # Unpack the data. Its structure depends on your model and on what you pass to 'fit()'
+        x, y = data
+        inputs = x['inputs']
+        segments = x['segments']
+        labels_cls = y['labels_cls']
+        labels_lm = y['labels_lm']
+
+        with tf.GradientTape() as tape:
+            y_pred = self([inputs, segments], training=True)  # Forward pass
+            # Compute loss value
+            logits_cls, logits_lm = y_pred[0], y_pred[1]
+            # loss_function은 model.compile단에서 정의
+            loss_cls = self.compiled_loss(labels_cls, logits_cls, regularization_losses=self.losses)
+            loss_lm = self.compiled_loss(labels_lm, logits_lm, regularization_losses=self.losses)
+            loss = loss_cls + loss_lm
+
+        # Compute gradients
+        trainable_vars = self.trainable_variables
+        gradients = tape.gradient(loss, trainable_vars)
+        # Update weights
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        # Update metrics (includes the metrics that tracks the loss)
+        self.compiled_metrics.update_state([labels_cls, labels_lm], y_pred)
+        # return a dict mapping metrics names to current value
+        return {m.name: m.result() for m in self.metrics}
+
+
+if __name__ == "__main__":
+    wrapper_make_pretrain_data()
+
+    if execType == "TEST":
+        dataset, model = makeModel(execType)
+    if execType == "LEARN":
+        dataset, model = makeModel(execType)
+        learn(model, dataset)

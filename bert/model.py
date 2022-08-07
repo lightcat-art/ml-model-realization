@@ -4,7 +4,8 @@ import sys
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
 from keras.losses import SparseCategoricalCrossentropy
-from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Input, Layer, Embedding
+from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer, Embedding, Input
+from tensorflow.keras import Model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import sentencepiece as spm
 from tqdm import tqdm
@@ -32,7 +33,6 @@ def load_vocab():
 
 
 vocab = load_vocab()
-
 
 config = Config.load('config.json')
 config.update({"n_enc_vocab": vocab.vocab_size()})
@@ -164,10 +164,13 @@ class Encoder(Layer):
         super(Encoder, self).__init__()
         self.config = config
         # with tf.variable_creator_scope('scope1'):
-        self.enc_emb = tf.keras.layers.Embedding(self.config.n_enc_vocab, self.config.embedding_dim, name='Encoder_enc_emb')
+        self.enc_emb = tf.keras.layers.Embedding(self.config.n_enc_vocab, self.config.embedding_dim,
+                                                 name='Encoder_enc_emb')
         # n_enc_seq에 +1 하는 이유가??
-        self.pos_emb = tf.keras.layers.Embedding(self.config.n_enc_seq + 1, self.config.embedding_dim, name='Encoder_pos_emb')
-        self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim, name='Encoder_seg_emb')
+        self.pos_emb = tf.keras.layers.Embedding(self.config.n_enc_seq + 1, self.config.embedding_dim,
+                                                 name='Encoder_pos_emb')
+        self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim,
+                                                 name='Encoder_seg_emb')
         self.encoder_layer = EncoderLayer(self.config)
 
     def call(self, inputs, segments):
@@ -179,8 +182,8 @@ class Encoder(Layer):
             positions = tf.random.uniform(shape=(100, self.config.n_enc_seq), minval=1, maxval=self.config.n_enc_seq,
                                           dtype=tf.dtypes.int32)
         elif execType == "LEARN":
-            positions = tf.keras.layers.Input(shape=(self.config.n_enc_seq,), name="positions",
-                                              dtype=tf.dtypes.int32)
+            positions = Input(shape=(self.config.n_enc_seq,), name="positions",
+                              dtype=tf.dtypes.int32)
         # i_pad (패딩으로 간주되는 토큰의 정수) 와 inputs를 비교하여 패딩마스크 생성 -> 패딩토큰:True, 단어토큰:False 으로 구성된 패딩마스크 생성
         pos_mask = tf.equal(inputs, self.config.i_pad)
         print('Encoder : positions = {}'.format(positions))
@@ -213,7 +216,8 @@ class BERT(Layer):
         super(BERT, self).__init__()
         self.config = config
         self.encoder = Encoder(self.config)
-        self.dense = Dense(units=self.config.embedding_dim, activation=tf.keras.activations.tanh, name='BERT_output_cls')
+        self.dense = Dense(units=self.config.embedding_dim, activation=tf.keras.activations.tanh,
+                           name='BERT_output_cls')
 
     def call(self, inputs, segments):
         # outputs : (batch_size, n_seq, embedding_dim)
@@ -229,6 +233,37 @@ class BERT(Layer):
 
         return outputs, outputs_cls
 
+
+# def bert_pretrain(config):
+#     if type == "TEST":
+#         print("makeModel : make instant input for forward pass")
+#         inputs = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1, maxval=vocab.vocab_size(),
+#                                         dtype=tf.dtypes.int32)
+#         segments = tf.random.uniform(shape=(100, config.n_enc_seq), minval=0, maxval=1,
+#                                           dtype=tf.dtypes.int32)
+#     elif type == "LEARN":
+#         print("makeModel : make tensor input for learn")
+#         inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+#         segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+#
+#     projection_cls = Dense(units=2, name='bert_pretrain_projection_cls')
+#     projection_lm = Dense(units=config.n_enc_vocab, name='bert_pretrain_projection_lm')
+#     print('BERTPretrain : inputs = {}'.format(inputs))
+#     # outputs : (batch_size, n_enc_seq, embedding_dim)
+#     # outputs_cls : (batch_size, embedding_dim)
+#     # attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
+#     outputs, outputs_cls = BERT(config)(inputs, segments)
+#
+#     # (batch_size, 2)
+#     # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
+#     # A의 다음문장이 B가 맞을경우는 True, 아닐경우는 False로 예측
+#     logits_cls = projection_cls(outputs_cls)
+#
+#     # (batch_size, n_enc_seq, n_enc_vocab)
+#     # MLM 예측
+#     logits_lm = projection_lm(outputs)
+#
+#     return Model(inputs=[inputs,segments], outputs=[logits_cls, logits_lm], name='bert_pretrain')
 
 class BERTPretrain(tf.keras.layers.Layer):
     def __init__(self, config):
@@ -572,9 +607,9 @@ def makeDataset(vocab, in_file):
     # segments = tf.ragged.constant(segments)
     # labels_lm = tf.ragged.constant(labels_lm)
     labels_cls = tf.expand_dims(labels_cls, axis=1)
-    print("sentences : [{},{}]".format(sentences.shape[0],sentences.shape[1]))
-    print("segments : [{},{}]".format(segments.shape[0],segments.shape[1]))
-    print("labels_lm : [{},{}]".format(labels_lm.shape[0],labels_lm.shape[1]))
+    print("sentences : [{},{}]".format(sentences.shape[0], sentences.shape[1]))
+    print("segments : [{},{}]".format(segments.shape[0], segments.shape[1]))
+    print("labels_lm : [{},{}]".format(labels_lm.shape[0], labels_lm.shape[1]))
     print("labels_cls : {}".format(labels_cls))
 
     dataset = tf.data.Dataset.from_tensor_slices(({'inputs': sentences, 'segments': segments},
@@ -643,6 +678,7 @@ class CustomModel(tf.keras.Model):
     """
     https://www.tensorflow.org/guide/keras/customizing_what_happens_in_fit?hl=ko
     """
+
     def train_step(self, data):
         # Unpack the data. Its structure depends on your model and on what you pass to 'fit()'
         x, y = data

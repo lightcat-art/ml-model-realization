@@ -1,3 +1,4 @@
 .idea
 *.bz2
 kowiki-data
+*.pyc

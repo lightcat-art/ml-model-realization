@@ -4,26 +4,38 @@ import sys
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
 from keras.losses import SparseCategoricalCrossentropy
-from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Input
+from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Input, Layer, Embedding
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 import sentencepiece as spm
 from tqdm import tqdm
 import numpy as np
-
 from config import Config
+from tensorflow.keras import Sequential
+
+#
+# import importlib
+#
+# importlib.reload(tf)
+# tf.executing_eagerly()
 
 sys.setrecursionlimit(100000)
 
-execType = "TEST"
+execType = "LEARN"
 
 
 def load_vocab():
     vocab_file = "../kowiki/kowiki.model"
     vocab = spm.SentencePieceProcessor()
     vocab.load(vocab_file)
+    print('load_vocab : vocab size = {}'.format(vocab.vocab_size()))
     return vocab
 
 
 vocab = load_vocab()
+
+
+config = Config.load('config.json')
+config.update({"n_enc_vocab": vocab.vocab_size()})
 
 
 def get_attn_pad_mask(seq_q, seq_k, i_pad):
@@ -33,8 +45,9 @@ def get_attn_pad_mask(seq_q, seq_k, i_pad):
     len_q = tf.shape(seq_q)[1]
     len_k = tf.shape(seq_k)[1]
 
+    print('get_attn_pad_mask : seq_k shape = {}'.format(seq_k))
     pad_attn_mask = tf.equal(seq_k, i_pad)
-
+    print('get_attn_pad_mask : pad_attn_mask shape = {}'.format(seq_k))
     # 텐서 반복확장
     pad_attn_mask = tf.broadcast_to(tf.expand_dims(pad_attn_mask, axis=1), [batch_size, len_q, len_k])
     # or
@@ -42,7 +55,7 @@ def get_attn_pad_mask(seq_q, seq_k, i_pad):
     return pad_attn_mask
 
 
-class MultiHeadAttention(tf.keras.layers.Layer):
+class MultiHeadAttention(Layer):
     def __init__(self, embedding_dim, n_enc_seq, num_heads=8, ):
         super(MultiHeadAttention, self).__init__()
         self.embedding_dim = embedding_dim
@@ -52,10 +65,10 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         assert embedding_dim % self.num_heads == 0
 
         self.projection_dim = embedding_dim // num_heads  # 하나의 헤드에 존재하는 차원수
-        self.query_dense = tf.keras.layers.Dense(embedding_dim)
-        self.key_dense = tf.keras.layers.Dense(embedding_dim)
-        self.value_dense = tf.keras.layers.Dense(embedding_dim)
-        self.dense = tf.keras.layers.Dense(embedding_dim)
+        self.query_dense = tf.keras.layers.Dense(embedding_dim, name='MultiHeadAttention_query_dense')
+        self.key_dense = tf.keras.layers.Dense(embedding_dim, name='MultiHeadAttention_key_dense')
+        self.value_dense = tf.keras.layers.Dense(embedding_dim, name='MultiHeadAttention_value_dense')
+        self.dense = tf.keras.layers.Dense(embedding_dim, name='MultiHeadAttention_final_dense')
 
     def scaled_dot_product_attention(self, query, key, value, mask):
         # print('scaled_dot_product_attention : query = {}'.format(query))
@@ -68,14 +81,16 @@ class MultiHeadAttention(tf.keras.layers.Layer):
 
         # 마스킹. 에턴션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
         # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 됨.
-        mask = tf.broadcast_to(tf.expand_dims(mask, axis=1), [batch_size, self.num_heads, self.n_enc_seq, self.n_enc_seq])
-        print('scaled_dot_product_attention : logits shape = {}'.format(tf.shape(logits)))
-        print('scaled_dot_product_attention : mask shape = {}'.format(tf.shape(mask)))
+        mask = tf.broadcast_to(tf.expand_dims(mask, axis=1),
+                               [batch_size, self.num_heads, self.n_enc_seq, self.n_enc_seq])
+        print('scaled_dot_product_attention : logits shape = {}'.format(logits))
+        print('scaled_dot_product_attention : mask shape = {}'.format(mask))
 
         # if mask is not None:
         #     logits += (mask * -1e9)
         # 패딩마스크를 logits 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 -1e9으로 업데이트)
-        logits = tf.where(mask, -1e9, logits)
+        # logits = tf.where(mask, -1e9, logits)
+        # logits = tf.where(mask, tf.constant(-1e9, dtype=tf.dtypes.int32, shape=(tf.shape(logits))), logits)
 
         attention_weights = tf.nn.softmax(logits, axis=-1)
 
@@ -96,20 +111,17 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         query = self.query_dense(inputs)
         key = self.key_dense(inputs)
         value = self.value_dense(inputs)
-
-        print('MultiHeadAttention : query = {}'.format(tf.shape(query)))
-        print('MultiHeadAttention : key = {}'.format(tf.shape(key)))
-        print('MultiHeadAttention : value = {}'.format(tf.shape(value)))
+        # print('MultiHeadAttention : query = {}'.format(query))
+        # print('MultiHeadAttention : key = {}'.format(key))
+        # print('MultiHeadAttention : value = {}'.format(value))
 
         # (batch_size, num_heads, seq_len, projection_dim)
         query = self.split_heads(query, batch_size)
         key = self.split_heads(key, batch_size)
         value = self.split_heads(value, batch_size)
-
-        print('MultiHeadAttention : query after split head = {}'.format(tf.shape(query)))
-        print('MultiHeadAttention : key after split head = {}'.format(tf.shape(key)))
-        print('MultiHeadAttention : value after split head = {}'.format(tf.shape(value)))
-
+        # print('MultiHeadAttention : query after split head = {}'.format(query))
+        # print('MultiHeadAttention : key after split head = {}'.format(key))
+        # print('MultiHeadAttention : value after split head = {}'.format(value))
         scaled_attention, attn_prob = self.scaled_dot_product_attention(query, key, value, mask)
 
         # head 다시 concatenate
@@ -122,20 +134,20 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         return outputs
 
 
-class EncoderLayer(tf.keras.layers.Layer):
+class EncoderLayer(Layer):
     def __init__(self, config):
         super(EncoderLayer, self).__init__()
         self.config = config
 
-        self.att = MultiHeadAttention(self.config.embedding_dim,  self.config.n_enc_seq, self.config.num_heads)
-        self.ffn = tf.keras.Sequential(
-            [tf.keras.layers.Dense(self.config.dff, activation="relu"),
-             tf.keras.layers.Dense(self.config.embedding_dim)]
+        self.att = MultiHeadAttention(self.config.embedding_dim, self.config.n_enc_seq, self.config.num_heads)
+        self.ffn = Sequential(
+            [Dense(self.config.dff, activation="relu", name='EncoderLayer_ffn_hidden'),
+             Dense(self.config.embedding_dim, name="EncoderLayer_ffn_output")]
         )
-        self.layernorm1 = LayerNormalization(epsilon=self.config.epsilon)
-        self.layernorm2 = LayerNormalization(epsilon=self.config.epsilon)
-        self.dropout1 = Dropout(self.config.dropout)
-        self.dropout2 = Dropout(self.config.dropout)
+        self.layernorm1 = LayerNormalization(epsilon=self.config.epsilon, name='EncoderLayerNorm1')
+        self.layernorm2 = LayerNormalization(epsilon=self.config.epsilon, name='EncoderLayerNorm2')
+        self.dropout1 = Dropout(self.config.dropout, name='EncoderLayer_dropout1')
+        self.dropout2 = Dropout(self.config.dropout, name='EncoderLayer_dropout2')
 
     def call(self, inputs, mask, training):
         attn_output = self.att(inputs, mask)  # 첫번째 서브층 : 멀티 헤드 어텐션
@@ -147,29 +159,34 @@ class EncoderLayer(tf.keras.layers.Layer):
         return self.layernorm2(out1 + ffn_output)  # Add & norm
 
 
-class Encoder(tf.keras.layers.Layer):
+class Encoder(Layer):
     def __init__(self, config):
         super(Encoder, self).__init__()
         self.config = config
         # with tf.variable_creator_scope('scope1'):
-        self.enc_emb = tf.keras.layers.Embedding(self.config.n_enc_vocab, self.config.embedding_dim)
+        self.enc_emb = tf.keras.layers.Embedding(self.config.n_enc_vocab, self.config.embedding_dim, name='Encoder_enc_emb')
         # n_enc_seq에 +1 하는 이유가??
-        self.pos_emb = tf.keras.layers.Embedding(self.config.n_enc_seq + 1, self.config.embedding_dim)
-        self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim)
+        self.pos_emb = tf.keras.layers.Embedding(self.config.n_enc_seq + 1, self.config.embedding_dim, name='Encoder_pos_emb')
+        self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim, name='Encoder_seg_emb')
+        self.encoder_layer = EncoderLayer(self.config)
 
     def call(self, inputs, segments):
+        positions = None
         print('Encoder : inputs = {}'.format(inputs))
+
         # 포지션 임베딩 inputs 생성 (크기는 inputs의 seq_length와 동일)
         if execType == "TEST":
             positions = tf.random.uniform(shape=(100, self.config.n_enc_seq), minval=1, maxval=self.config.n_enc_seq,
                                           dtype=tf.dtypes.int32)
         elif execType == "LEARN":
-            positions = tf.keras.layers.Input(shape=(None, self.config.n_enc_seq), name="positions",
+            positions = tf.keras.layers.Input(shape=(self.config.n_enc_seq,), name="positions",
                                               dtype=tf.dtypes.int32)
         # i_pad (패딩으로 간주되는 토큰의 정수) 와 inputs를 비교하여 패딩마스크 생성 -> 패딩토큰:True, 단어토큰:False 으로 구성된 패딩마스크 생성
         pos_mask = tf.equal(inputs, self.config.i_pad)
+        print('Encoder : positions = {}'.format(positions))
+        print('Encoder : pos_mask = {}'.format(pos_mask))
         # 패딩마스크를 positions 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 0으로 업데이트)
-        positions = tf.where(pos_mask, 0, positions)
+        # positions = tf.where(pos_mask, tf.constant(0, dtype=tf.dtypes.int32, shape=(tf.shape(inputs))), positions)
 
         # (batch_size, n_enc_seq, embedding_dim)
         outputs = self.enc_emb(inputs) + self.pos_emb(positions) + self.seg_emb(segments)
@@ -181,13 +198,13 @@ class Encoder(tf.keras.layers.Layer):
 
         for i in range(self.config.n_layer):
             # (batch_size, n_enc_seq, embedding_dim), (batch_size, num_heads, n_enc_seq, n_enc_seq)
-            outputs = EncoderLayer(self.config)(outputs, attn_mask, training=True)
+            outputs = self.encoder_layer(outputs, attn_mask, training=True)
             # attn_probs.append(attn_prob)
 
         return outputs
 
 
-class BERT(tf.keras.layers.Layer):
+class BERT(Layer):
     """
     bert
     """
@@ -196,7 +213,7 @@ class BERT(tf.keras.layers.Layer):
         super(BERT, self).__init__()
         self.config = config
         self.encoder = Encoder(self.config)
-        self.dense = Dense(units=self.config.embedding_dim, activation=tf.keras.activations.tanh)
+        self.dense = Dense(units=self.config.embedding_dim, activation=tf.keras.activations.tanh, name='BERT_output_cls')
 
     def call(self, inputs, segments):
         # outputs : (batch_size, n_seq, embedding_dim)
@@ -220,13 +237,13 @@ class BERTPretrain(tf.keras.layers.Layer):
         self.bert = BERT(self.config)
 
         # NSP(Next Sentence Prediction) Classifier
-        self.projection_cls = Dense(units=2)
+        self.projection_cls = Dense(units=2, name='BERTPretrain_projection_cls')
         # MLM(Masked Language Model) classifier
 
         # 왜 MLM weight를 enc_emb weight 와 share하는것인지?
         # enc_emb 층과 weight share
         # with tf.variable_creator_scope('scope1', reuse=True):
-        self.projection_lm = Dense(units=self.config.n_enc_vocab)
+        self.projection_lm = Dense(units=self.config.n_enc_vocab, name='BERTPretrain_projection_lm')
 
     def call(self, inputs, segments):
         print('BERTPretrain : inputs = {}'.format(inputs))
@@ -492,7 +509,7 @@ def wrapper_make_pretrain_data():
     out_file = "../kowiki-data/kowiki_bert_{}.json"
     count = 10
     # kowiki 학습데이터를 살펴보니 단락이 꽤나 길어서 256개로는 데이터 뒷부분을 제대로 활용하기 힘들수도 있지만... 일단 적용
-    n_seq = 256  # 단락(문장) 최대길이.
+    n_seq = config.n_enc_seq  # 단락(문장) 최대길이.
     mask_prob = 0.15
     make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_line_cnt=1000)
 
@@ -540,11 +557,26 @@ def makeDataset(vocab, in_file):
     # print("segments : {}".format(segments))
     # print("labels_cls : {}".format(labels_cls))
     # print("labels_lm : {}".format(labels_lm))
+    """
+    DataSet에서 inputs의 길이가 같아지도록 짧은 문장에 padding(0)을 추가해야함.
+    DataSet에서 segments의 길이가 같아지도록 짧은 문장에 padding(0)을 추가해야함.
+    DataSet에서 labels_lm의 길이가 같아지도록 짧은문장에 padding(-1)를 추가해야함.
+        - sentence에 구성된 토큰 중 Mask된 인덱스에 넣는 정답 토큰값 빼고는 모두 -1을 넣는것을 기본으로 하고 있으므로.
+    """
 
-    sentences = tf.ragged.constant(sentences)
-    segments = tf.ragged.constant(segments)
-    labels_cls = tf.ragged.constant(labels_cls)
-    labels_lm = tf.ragged.constant(labels_lm)
+    sentences = pad_sequences(sentences, maxlen=config.n_enc_seq, padding='post', value=0)
+    segments = pad_sequences(segments, maxlen=config.n_enc_seq, padding='post', value=0)
+    labels_lm = pad_sequences(labels_lm, maxlen=config.n_enc_seq, padding='post', value=-1)
+
+    # sentences = tf.ragged.constant(sentences)
+    # segments = tf.ragged.constant(segments)
+    # labels_lm = tf.ragged.constant(labels_lm)
+    labels_cls = tf.expand_dims(labels_cls, axis=1)
+    print("sentences : [{},{}]".format(sentences.shape[0],sentences.shape[1]))
+    print("segments : [{},{}]".format(segments.shape[0],segments.shape[1]))
+    print("labels_lm : [{},{}]".format(labels_lm.shape[0],labels_lm.shape[1]))
+    print("labels_cls : {}".format(labels_cls))
+
     dataset = tf.data.Dataset.from_tensor_slices(({'inputs': sentences, 'segments': segments},
                                                   {'labels_cls': labels_cls, 'labels_lm': labels_lm}))
 
@@ -552,54 +584,65 @@ def makeDataset(vocab, in_file):
     return dataset
 
 
-def makeModel(type="LEARN"):
-    """
-    TODO:
-    1. DataSet에서 batch 만들기.
-    2. DataSet에서 inputs의 길이가 같아지도록 짧은 문장에 padding(0)을 추가해야함.
-    3. DataSet에서 segments의 길이가 같아지도록 짧은 문장에 padding(0)을 추가해야함.
+class Train:
+    def __init__(self):
+        self.inputs = None
+        self.segments = None
+        self.logits_cls = None
+        self.logits_lm = None
+        self.model = None
+        self.dataset = None
+        self.BATCH_SIZE = 64
+        self.BUFFER_SIZE = 20000
 
-    4. inputs, segments를 입력으로 하여 BERTPretrain 실행
-    5. 나온 결과값인 logits_cls, logits_lm 값을 가지고  labels_cls, labels_lm 와 loss 계산
-    6. loss_cls + loss_lm = loss_total
-    7. loss, optimizer를 이용해 학습진행
-
-    4. DataSet에서 from_tensor_slices를 이용하여 데이터 세팅.
-    """
-    config = Config.load("config.json")
-    filepath = "../kowiki-data/kowiki_bert_{}.json"
-    dataset = makeDataset(vocab, filepath)
-
-    inputs = None
-    segments = None
-    if type == "TEST":
-        print("makeModel : make instant input for forward pass")
-        inputs = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1, maxval=vocab.vocab_size(),
-                                   dtype=tf.dtypes.int32)
-        segments = tf.random.uniform(shape=(100, config.n_enc_seq), minval=0, maxval=1,
-                                     dtype=tf.dtypes.int32)
-        # inputs = tf.constant(shape=(100, config.n_enc_seq), name="inputs")
-        # segments = tf.constant(shape=(100, config.n_enc_seq), name="segments")
-    elif type == "LEARN":
-        print("makeModel : make tensor input for learn")
-        inputs = Input(shape=(None, config.n_enc_seq), name="inputs")
-        segments = Input(shape=(None, config.n_enc_seq), name="segments")
-    bert_layer = BERTPretrain(config)
-    logits_cls, logits_lm = bert_layer(inputs, segments)
-    model = CustomModel(inputs=[inputs, segments], outputs=[logits_cls, logits_lm])
-    return dataset, model
+    def makeInnerModel(self, type="LEARN"):
+        """
+        TODO:
+        1. DataSet에서 batch 만들기.
 
 
-def learn(model, dataset):
-    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    model.fit(dataset, epochs=1)
+        4. inputs, segments를 입력으로 하여 BERTPretrain 실행
+        5. 나온 결과값인 logits_cls, logits_lm 값을 가지고  labels_cls, labels_lm 와 loss 계산
+        6. loss_cls + loss_lm = loss_total
+        7. loss, optimizer를 이용해 학습진행
+
+        4. DataSet에서 from_tensor_slices를 이용하여 데이터 세팅.
+        """
+        # config = Config.load("config.json")
+        filepath = "../kowiki-data/kowiki_bert_{}.json"
+        self.dataset = makeDataset(vocab, filepath)
+        self.dataset = self.dataset.cache()
+        self.dataset = self.dataset.shuffle(self.BUFFER_SIZE)
+        self.dataset = self.dataset.batch(self.BATCH_SIZE)
+        self.dataset = self.dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+        if type == "TEST":
+            print("makeModel : make instant input for forward pass")
+            self.inputs = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1, maxval=vocab.vocab_size(),
+                                            dtype=tf.dtypes.int32)
+            self.segments = tf.random.uniform(shape=(100, config.n_enc_seq), minval=0, maxval=1,
+                                              dtype=tf.dtypes.int32)
+            # inputs = tf.constant(shape=(100, config.n_enc_seq), name="inputs")
+            # segments = tf.constant(shape=(100, config.n_enc_seq), name="segments")
+        elif type == "LEARN":
+            print("makeModel : make tensor input for learn")
+            self.inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+            self.segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+
+        bert_layer = BERTPretrain(config)
+        self.logits_cls, self.logits_lm = bert_layer(self.inputs, self.segments)
+        # model = CustomModel(inputs=[inputs, segments], outputs=[logits_cls, logits_lm])
+
+    def learn(self):
+        self.model = CustomModel(inputs=[self.inputs, self.segments], outputs=[self.logits_cls, self.logits_lm])
+        self.model.compile(optimizer="adam", loss=SparseCategoricalCrossentropy, metrics=["accuracy"])
+        self.model.fit(self.dataset, epochs=2)
 
 
 class CustomModel(tf.keras.Model):
     """
     https://www.tensorflow.org/guide/keras/customizing_what_happens_in_fit?hl=ko
     """
-
     def train_step(self, data):
         # Unpack the data. Its structure depends on your model and on what you pass to 'fit()'
         x, y = data
@@ -621,6 +664,7 @@ class CustomModel(tf.keras.Model):
         trainable_vars = self.trainable_variables
         gradients = tape.gradient(loss, trainable_vars)
         # Update weights
+        # if(isinstance(self.optimizer), tf.)
         self.optimizer.apply_gradients(zip(gradients, trainable_vars))
         # Update metrics (includes the metrics that tracks the loss)
         self.compiled_metrics.update_state([labels_cls, labels_lm], y_pred)
@@ -631,8 +675,9 @@ class CustomModel(tf.keras.Model):
 if __name__ == "__main__":
     wrapper_make_pretrain_data()
 
+    train = Train()
     if execType == "TEST":
-        dataset, model = makeModel(execType)
+        train.makeInnerModel(execType)
     if execType == "LEARN":
-        dataset, model = makeModel(execType)
-        learn(model, dataset)
+        train.makeInnerModel(execType)
+        train.learn()

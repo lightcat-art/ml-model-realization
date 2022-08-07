@@ -1,16 +1,9 @@
 {
-
-
-    "d_ff": 3072,
-    "d_head": 64,
-    "layer_norm_epsilon": 1e-12,
-    "n_output": 2,
-
     "embedding_dim": 512,
     "num_heads": 8,
     "dff": 3072,
     "dropout": 0.1,
-    "epsilon": 1e-6,
+    "epsilon": 1e-12,
     "n_enc_vocab": 20000,
     "n_enc_seq": 256,
     "n_seg_type": 2,

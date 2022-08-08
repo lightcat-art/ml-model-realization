@@ -1,11 +1,12 @@
 import json
 import os
 import sys
+import traceback
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
 from keras.losses import SparseCategoricalCrossentropy
-from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer, Embedding, Input
-from tensorflow.keras import Model
+from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer, Embedding, concatenate
+from tensorflow.keras import Model, Input
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import sentencepiece as spm
 from tqdm import tqdm
@@ -204,6 +205,7 @@ class Encoder(Layer):
             outputs = self.encoder_layer(outputs, attn_mask, training=True)
             # attn_probs.append(attn_prob)
 
+        print('making Encoder network end')
         return outputs
 
 
@@ -231,6 +233,7 @@ class BERT(Layer):
         # outputs_cls에 Dense 및 tanh activation 통과.
         outputs_cls = self.dense(outputs_cls)
 
+        print('making BERT network end')
         return outputs, outputs_cls
 
 
@@ -265,7 +268,7 @@ class BERT(Layer):
 #
 #     return Model(inputs=[inputs,segments], outputs=[logits_cls, logits_lm], name='bert_pretrain')
 
-class BERTPretrain(tf.keras.layers.Layer):
+class BERTPretrain(Layer):
     def __init__(self, config):
         super(BERTPretrain, self).__init__()
         self.config = config
@@ -290,12 +293,16 @@ class BERTPretrain(tf.keras.layers.Layer):
         # (batch_size, 2)
         # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
         # A의 다음문장이 B가 맞을경우는 True, 아닐경우는 False로 예측
+        print('BERTPretrain : output_cls shape = {}'.format(outputs_cls.shape))
+        print('BERTPretrain : output_cls type = {}'.format(type(outputs_cls)))
         logits_cls = self.projection_cls(outputs_cls)
-
         # (batch_size, n_enc_seq, n_enc_vocab)
         # MLM 예측
+        print('BERTPretrain : output shape = {}'.format(outputs.shape))
+        print('BERTPretrain : output type = {}'.format(type(outputs)))
         logits_lm = self.projection_lm(outputs)
-
+        print('BERTPretrain : logits_cls shape = {}, logits_lm shape = {}'.format(logits_cls.shape, logits_lm.shape))
+        print('making BERTPretrain network end')
         return logits_cls, logits_lm
 
 
@@ -612,11 +619,11 @@ def makeDataset(vocab, in_file):
     print("labels_lm : [{},{}]".format(labels_lm.shape[0], labels_lm.shape[1]))
     print("labels_cls : {}".format(labels_cls))
 
-    dataset = tf.data.Dataset.from_tensor_slices(({'inputs': sentences, 'segments': segments},
-                                                  {'labels_cls': labels_cls, 'labels_lm': labels_lm}))
+    # dataset = tf.data.Dataset.from_tensor_slices(({'inputs': sentences, 'segments': segments},
+    #                                               {'labels_cls': labels_cls, 'labels_lm': labels_lm}))
 
     print("makeDataset end")
-    return dataset
+    return {'inputs': sentences, 'segments': segments}, {'labels_cls': labels_cls, 'labels_lm': labels_lm}
 
 
 class Train:
@@ -625,8 +632,11 @@ class Train:
         self.segments = None
         self.logits_cls = None
         self.logits_lm = None
+        self.concat_output = None
         self.model = None
         self.dataset = None
+        self.x = None
+        self.y = None
         self.BATCH_SIZE = 64
         self.BUFFER_SIZE = 20000
 
@@ -645,11 +655,11 @@ class Train:
         """
         # config = Config.load("config.json")
         filepath = "../kowiki-data/kowiki_bert_{}.json"
-        self.dataset = makeDataset(vocab, filepath)
-        self.dataset = self.dataset.cache()
-        self.dataset = self.dataset.shuffle(self.BUFFER_SIZE)
-        self.dataset = self.dataset.batch(self.BATCH_SIZE)
-        self.dataset = self.dataset.prefetch(tf.data.experimental.AUTOTUNE)
+        self.x, self.y = makeDataset(vocab, filepath)
+        # self.dataset = self.dataset.cache()
+        # self.dataset = self.dataset.shuffle(buffer_size=self.BUFFER_SIZE)
+        # self.dataset = self.dataset.batch(self.BATCH_SIZE)
+        # self.dataset = self.dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
         if type == "TEST":
             print("makeModel : make instant input for forward pass")
@@ -664,14 +674,25 @@ class Train:
             self.inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
             self.segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
 
-        bert_layer = BERTPretrain(config)
-        self.logits_cls, self.logits_lm = bert_layer(self.inputs, self.segments)
-        # model = CustomModel(inputs=[inputs, segments], outputs=[logits_cls, logits_lm])
+        print('before make BERT network')
+        try:
+            bert_layer = BERTPretrain(config)
+            # 에러 : self.logits_cls, self.logits_lm 가 None으로 반환됨.
+            self.logits_cls, self.logits_lm = bert_layer(self.inputs, self.segments)
+        except Exception as e:
+            traceback.print_exc()
+            print('error occured')
+
+        print('make bert layer : logits_cls = {}, logits_lm = {}'.format(self.logits_cls, self.logits_lm))
+        self.concat_output = concatenate([self.logits_cls, self.logits_lm])
+        print('concat_output shape = {}'.format(self.concat_output.shape))
+        print('after make BERT network')
 
     def learn(self):
-        self.model = CustomModel(inputs=[self.inputs, self.segments], outputs=[self.logits_cls, self.logits_lm])
+        self.model = CustomModel(inputs=[self.inputs, self.segments], outputs=self.concat_output)
         self.model.compile(optimizer="adam", loss=SparseCategoricalCrossentropy, metrics=["accuracy"])
-        self.model.fit(self.dataset, epochs=2)
+        self.model.fit(x=[self.x['inputs'], self.x['segments']], y=[self.y['labels_cls'], self.y['labels_lm']],
+                       batch_size=self.BATCH_SIZE, epochs=2)
 
 
 class CustomModel(tf.keras.Model):
@@ -681,11 +702,12 @@ class CustomModel(tf.keras.Model):
 
     def train_step(self, data):
         # Unpack the data. Its structure depends on your model and on what you pass to 'fit()'
+        print('train_step : data={}'.format(data.shape))
         x, y = data
-        inputs = x['inputs']
-        segments = x['segments']
-        labels_cls = y['labels_cls']
-        labels_lm = y['labels_lm']
+        inputs = x[0]
+        segments = x[1]
+        labels_cls = y[0]
+        labels_lm = y[1]
 
         with tf.GradientTape() as tape:
             y_pred = self([inputs, segments], training=True)  # Forward pass

@@ -56,6 +56,40 @@ def get_attn_pad_mask(seq_q, seq_k, i_pad):
     return pad_attn_mask
 
 
+def scaled_dot_product_attention(query, key, value, mask, num_heads, n_enc_seq):
+    # print('scaled_dot_product_attention : query = {}'.format(query))
+    # print('scaled_dot_product_attention : key = {}'.format(key))
+    # print('scaled_dot_product_attention : value = {}'.format(value))
+    matmul_qk = tf.matmul(query, key, transpose_b=True)
+    depth = tf.cast(tf.shape(key)[-1], tf.float32)  # Head의 projection_dim
+    batch_size = tf.cast(tf.shape(key)[0], tf.float32)  # Head의 projection_dim
+    logits = matmul_qk / tf.math.sqrt(depth)
+
+    # 마스킹. 에턴션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
+    # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 됨.
+    mask = tf.broadcast_to(tf.expand_dims(mask, axis=1),
+                           [batch_size, num_heads, n_enc_seq, n_enc_seq])
+    print('scaled_dot_product_attention : logits shape = {}'.format(logits))
+    print('scaled_dot_product_attention : mask shape = {}'.format(mask))
+
+    # if mask is not None:
+    #     logits += (mask * -1e9)
+    # 패딩마스크를 logits 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 -1e9으로 업데이트)
+    # logits = tf.where(mask, -1e9, logits)
+    # logits = tf.where(mask, tf.constant(-1e9, dtype=tf.dtypes.int32, shape=(tf.shape(logits))), logits)
+
+    attention_weights = tf.nn.softmax(logits, axis=-1)
+
+    # output 크기 : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
+    output = tf.matmul(attention_weights, value)
+    return output, attention_weights
+
+
+def split_heads(x, batch_size, num_heads, projection_dim):
+    x = tf.reshape(x, (batch_size, -1, num_heads, projection_dim))
+    return tf.transpose(x, perm=[0, 2, 1, 3])
+
+
 class MultiHeadAttention(Layer):
     def __init__(self, embedding_dim, n_enc_seq, num_heads=8, ):
         super(MultiHeadAttention, self).__init__()
@@ -71,38 +105,6 @@ class MultiHeadAttention(Layer):
         self.value_dense = tf.keras.layers.Dense(embedding_dim, name='MultiHeadAttention_value_dense')
         self.dense = tf.keras.layers.Dense(embedding_dim, name='MultiHeadAttention_final_dense')
 
-    def scaled_dot_product_attention(self, query, key, value, mask):
-        # print('scaled_dot_product_attention : query = {}'.format(query))
-        # print('scaled_dot_product_attention : key = {}'.format(key))
-        # print('scaled_dot_product_attention : value = {}'.format(value))
-        matmul_qk = tf.matmul(query, key, transpose_b=True)
-        depth = tf.cast(tf.shape(key)[-1], tf.float32)  # Head의 projection_dim
-        batch_size = tf.cast(tf.shape(key)[0], tf.float32)  # Head의 projection_dim
-        logits = matmul_qk / tf.math.sqrt(depth)
-
-        # 마스킹. 에턴션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
-        # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 됨.
-        mask = tf.broadcast_to(tf.expand_dims(mask, axis=1),
-                               [batch_size, self.num_heads, self.n_enc_seq, self.n_enc_seq])
-        print('scaled_dot_product_attention : logits shape = {}'.format(logits))
-        print('scaled_dot_product_attention : mask shape = {}'.format(mask))
-
-        # if mask is not None:
-        #     logits += (mask * -1e9)
-        # 패딩마스크를 logits 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 -1e9으로 업데이트)
-        # logits = tf.where(mask, -1e9, logits)
-        # logits = tf.where(mask, tf.constant(-1e9, dtype=tf.dtypes.int32, shape=(tf.shape(logits))), logits)
-
-        attention_weights = tf.nn.softmax(logits, axis=-1)
-
-        # output 크기 : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
-        output = tf.matmul(attention_weights, value)
-        return output, attention_weights
-
-    def split_heads(self, x, batch_size):
-        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.projection_dim))
-        return tf.transpose(x, perm=[0, 2, 1, 3])
-
     def call(self, inputs, mask):
         # print('MultiHeadAttention : input = {}'.format(inputs))
         # x.shape = [batch_size, seq_len, embedding_dim]
@@ -117,13 +119,14 @@ class MultiHeadAttention(Layer):
         # print('MultiHeadAttention : value = {}'.format(value))
 
         # (batch_size, num_heads, seq_len, projection_dim)
-        query = self.split_heads(query, batch_size)
-        key = self.split_heads(key, batch_size)
-        value = self.split_heads(value, batch_size)
+        query = split_heads(query, batch_size, self.num_heads, self.projection_dim)
+        key = split_heads(key, batch_size, self.num_heads, self.projection_dim)
+        value = split_heads(value, batch_size, self.num_heads, self.projection_dim)
         # print('MultiHeadAttention : query after split head = {}'.format(query))
         # print('MultiHeadAttention : key after split head = {}'.format(key))
         # print('MultiHeadAttention : value after split head = {}'.format(value))
-        scaled_attention, attn_prob = self.scaled_dot_product_attention(query, key, value, mask)
+        scaled_attention, attn_prob = scaled_dot_product_attention(query, key, value, mask, self.num_heads,
+                                                                   self.n_enc_seq)
 
         # head 다시 concatenate
         # (batch_size, seq_len, num_heads, projection_dim)
@@ -136,7 +139,7 @@ class MultiHeadAttention(Layer):
 
 
 def encoder_layer(config, training, name='encoder_layer'):
-    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+    inputs = Input(shape=(config.n_enc_seq, config.embedding_dim), name="inputs", dtype=tf.dtypes.float32)
     mask = Input(shape=(config.n_enc_seq, config.n_enc_seq), name="attn_mask", dtype=tf.dtypes.bool)
     attn_output = MultiHeadAttention(config.embedding_dim, config.n_enc_seq, config.num_heads)(inputs,
                                                                                                mask)  # 첫번째 서브층 : 멀티 헤드 어텐션
@@ -178,6 +181,49 @@ class EncoderLayer(Layer):
         return self.layernorm2(out1 + ffn_output)  # Add & norm
 
 
+def encoder(config, name='encoder'):
+    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+    segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+    # 포지션 임베딩 inputs 생성 (크기는 inputs의 seq_length와 동일)
+    positions = None
+    if execType == "TEST":
+        positions = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1,
+                                      maxval=config.n_enc_seq,
+                                      dtype=tf.dtypes.int32)
+    elif execType == "LEARN":
+        # positions = Input(shape=(config.n_enc_seq,), name="positions", dtype=tf.dtypes.int32)
+        positions = tf.constant([i+1 for i in range(config.n_enc_seq)])
+    print('encoder : positions shape = {}'.format(positions.shape))
+    enc_emb = tf.keras.layers.Embedding(config.n_enc_vocab, config.embedding_dim, name='Encoder_enc_emb')
+    # n_enc_seq에 +1 하는 이유가??
+    pos_emb = tf.keras.layers.Embedding(config.n_enc_seq + 1, config.embedding_dim, name='Encoder_pos_emb')
+    seg_emb = tf.keras.layers.Embedding(config.n_seg_type, config.embedding_dim, name='Encoder_seg_emb')
+    print('Encoder : inputs = {}'.format(inputs))
+
+    # i_pad (패딩으로 간주되는 토큰의 정수) 와 inputs를 비교하여 패딩마스크 생성 -> 패딩토큰:True, 단어토큰:False 으로 구성된 패딩마스크 생성
+    pos_mask = tf.equal(inputs, config.i_pad)
+    print('Encoder : positions = {}'.format(positions))
+    print('Encoder : pos_mask = {}'.format(pos_mask))
+    # 패딩마스크를 positions 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 0으로 업데이트)
+    # positions = tf.where(pos_mask, tf.constant(0, dtype=tf.dtypes.int32, shape=(tf.shape(inputs))), positions)
+
+    # (batch_size, n_enc_seq, embedding_dim)
+    outputs = enc_emb(inputs) + pos_emb(positions) + seg_emb(segments)
+
+    # (batch_size, n_enc_seq, n_enc_seq)
+    attn_mask = get_attn_pad_mask(seq_q=inputs, seq_k=inputs, i_pad=config.i_pad)
+
+    attn_probs = []
+
+    for i in range(config.n_layer):
+        # (batch_size, n_enc_seq, embedding_dim), (batch_size, num_heads, n_enc_seq, n_enc_seq)
+        outputs = encoder_layer(config, training=True, name='encoder_layer_{}'.format(i))([outputs, attn_mask])
+        # attn_probs.append(attn_prob)
+
+    print('making Encoder network end')
+    return Model(inputs=[inputs, segments], outputs=outputs, name=name)
+
+
 class Encoder(Layer):
     def __init__(self, config):
         super(Encoder, self).__init__()
@@ -191,27 +237,29 @@ class Encoder(Layer):
         self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim,
                                                  name='Encoder_seg_emb')
         # self.encoder_layer = EncoderLayer(self.config)
+        # 포지션 임베딩 inputs 생성 (크기는 inputs의 seq_length와 동일)
+        # 포지션 임베딩은
+        self.positions = None
+        if execType == "TEST":
+            self.positions = tf.random.uniform(shape=(100, self.config.n_enc_seq), minval=1,
+                                               maxval=self.config.n_enc_seq,
+                                               dtype=tf.dtypes.int32)
+        elif execType == "LEARN":
+            self.positions = Input(shape=(self.config.n_enc_seq,), name="positions",
+                                   dtype=tf.dtypes.int32)
 
     def call(self, inputs, segments):
-        positions = None
         print('Encoder : inputs = {}'.format(inputs))
 
-        # 포지션 임베딩 inputs 생성 (크기는 inputs의 seq_length와 동일)
-        if execType == "TEST":
-            positions = tf.random.uniform(shape=(100, self.config.n_enc_seq), minval=1, maxval=self.config.n_enc_seq,
-                                          dtype=tf.dtypes.int32)
-        elif execType == "LEARN":
-            positions = Input(shape=(self.config.n_enc_seq,), name="positions",
-                              dtype=tf.dtypes.int32)
         # i_pad (패딩으로 간주되는 토큰의 정수) 와 inputs를 비교하여 패딩마스크 생성 -> 패딩토큰:True, 단어토큰:False 으로 구성된 패딩마스크 생성
         pos_mask = tf.equal(inputs, self.config.i_pad)
-        print('Encoder : positions = {}'.format(positions))
+        print('Encoder : positions = {}'.format(self.positions))
         print('Encoder : pos_mask = {}'.format(pos_mask))
         # 패딩마스크를 positions 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 0으로 업데이트)
         # positions = tf.where(pos_mask, tf.constant(0, dtype=tf.dtypes.int32, shape=(tf.shape(inputs))), positions)
 
         # (batch_size, n_enc_seq, embedding_dim)
-        outputs = self.enc_emb(inputs) + self.pos_emb(positions) + self.seg_emb(segments)
+        outputs = self.enc_emb(inputs) + self.pos_emb(self.positions) + self.seg_emb(segments)
 
         # (batch_size, n_enc_seq, n_enc_seq)
         attn_mask = get_attn_pad_mask(seq_q=inputs, seq_k=inputs, i_pad=self.config.i_pad)
@@ -220,11 +268,31 @@ class Encoder(Layer):
 
         for i in range(self.config.n_layer):
             # (batch_size, n_enc_seq, embedding_dim), (batch_size, num_heads, n_enc_seq, n_enc_seq)
-            outputs = encoder_layer(config, training=True)([outputs, attn_mask])
+            outputs = encoder_layer(config, training=True, name='encoder_layer_{}'.format(i))([outputs, attn_mask])
             # attn_probs.append(attn_prob)
 
         print('making Encoder network end')
         return outputs
+
+
+def bert(config):
+    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+    segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+    dense = Dense(units=config.embedding_dim, activation=tf.keras.activations.tanh,
+                  name='BERT_output_cls')
+    # outputs : (batch_size, n_seq, embedding_dim)
+    # self_attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
+    outputs = encoder(config)([inputs, segments])
+
+    # (batch_size, embedding_dim)
+    # 첫번째([CLS]) Token을 저장.
+    # outputs_cls = outputs[:,0].contiguous()
+    outputs_cls = outputs[:, 0]
+    # outputs_cls에 Dense 및 tanh activation 통과.
+    outputs_cls = dense(outputs_cls)
+
+    print('making BERT network end')
+    return Model(inputs=[inputs, segments], outputs=[outputs, outputs_cls])
 
 
 class BERT(Layer):
@@ -265,7 +333,7 @@ def bert_pretrain(config, name="bert_pretrain"):
     # outputs : (batch_size, n_enc_seq, embedding_dim)
     # outputs_cls : (batch_size, embedding_dim)
     # attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
-    outputs, outputs_cls = BERT(config)(inputs, segments)
+    outputs, outputs_cls = bert(config)([inputs, segments])
 
     # (batch_size, 2)
     # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)

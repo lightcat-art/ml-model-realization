@@ -135,6 +135,24 @@ class MultiHeadAttention(Layer):
         return outputs
 
 
+def encoder_layer(config, training, name='encoder_layer'):
+    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+    mask = Input(shape=(config.n_enc_seq, config.n_enc_seq), name="attn_mask", dtype=tf.dtypes.bool)
+    attn_output = MultiHeadAttention(config.embedding_dim, config.n_enc_seq, config.num_heads)(inputs,
+                                                                                               mask)  # 첫번째 서브층 : 멀티 헤드 어텐션
+    # training 옵션 : 학습시에만 적용되고 추론시에는 적용되지 않도록 하는 옵션
+    attn_output = Dropout(config.dropout, name='EncoderLayer_dropout1')(attn_output, training=training)
+    out1 = LayerNormalization(epsilon=config.epsilon, name='EncoderLayerNorm1')(inputs + attn_output)  # Add & norm
+    ffn_output = Sequential(
+        [Dense(config.dff, activation="relu", name='EncoderLayer_ffn_hidden'),
+         Dense(config.embedding_dim, name="EncoderLayer_ffn_output")]
+    )(out1)  # 두번째 서브층 : 포지션 와이즈 피드 포워드 신경망
+    ffn_output = Dropout(config.dropout, name='EncoderLayer_dropout2')(ffn_output, training=training)
+    encoder_layer_output = LayerNormalization(epsilon=config.epsilon, name='EncoderLayerNorm2')(
+        out1 + ffn_output)  # Add & norm
+    return Model(inputs=[inputs, mask], outputs=encoder_layer_output, name=name)
+
+
 class EncoderLayer(Layer):
     def __init__(self, config):
         super(EncoderLayer, self).__init__()
@@ -172,7 +190,7 @@ class Encoder(Layer):
                                                  name='Encoder_pos_emb')
         self.seg_emb = tf.keras.layers.Embedding(self.config.n_seg_type, self.config.embedding_dim,
                                                  name='Encoder_seg_emb')
-        self.encoder_layer = EncoderLayer(self.config)
+        # self.encoder_layer = EncoderLayer(self.config)
 
     def call(self, inputs, segments):
         positions = None
@@ -202,7 +220,7 @@ class Encoder(Layer):
 
         for i in range(self.config.n_layer):
             # (batch_size, n_enc_seq, embedding_dim), (batch_size, num_heads, n_enc_seq, n_enc_seq)
-            outputs = self.encoder_layer(outputs, attn_mask, training=True)
+            outputs = encoder_layer(config, training=True)([outputs, attn_mask])
             # attn_probs.append(attn_prob)
 
         print('making Encoder network end')
@@ -237,36 +255,29 @@ class BERT(Layer):
         return outputs, outputs_cls
 
 
-# def bert_pretrain(config):
-#     if type == "TEST":
-#         print("makeModel : make instant input for forward pass")
-#         inputs = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1, maxval=vocab.vocab_size(),
-#                                         dtype=tf.dtypes.int32)
-#         segments = tf.random.uniform(shape=(100, config.n_enc_seq), minval=0, maxval=1,
-#                                           dtype=tf.dtypes.int32)
-#     elif type == "LEARN":
-#         print("makeModel : make tensor input for learn")
-#         inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
-#         segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
-#
-#     projection_cls = Dense(units=2, name='bert_pretrain_projection_cls')
-#     projection_lm = Dense(units=config.n_enc_vocab, name='bert_pretrain_projection_lm')
-#     print('BERTPretrain : inputs = {}'.format(inputs))
-#     # outputs : (batch_size, n_enc_seq, embedding_dim)
-#     # outputs_cls : (batch_size, embedding_dim)
-#     # attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
-#     outputs, outputs_cls = BERT(config)(inputs, segments)
-#
-#     # (batch_size, 2)
-#     # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
-#     # A의 다음문장이 B가 맞을경우는 True, 아닐경우는 False로 예측
-#     logits_cls = projection_cls(outputs_cls)
-#
-#     # (batch_size, n_enc_seq, n_enc_vocab)
-#     # MLM 예측
-#     logits_lm = projection_lm(outputs)
-#
-#     return Model(inputs=[inputs,segments], outputs=[logits_cls, logits_lm], name='bert_pretrain')
+def bert_pretrain(config, name="bert_pretrain"):
+    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
+    segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+
+    projection_cls = Dense(units=2, name='bert_pretrain_projection_cls')
+    projection_lm = Dense(units=config.n_enc_vocab, name='bert_pretrain_projection_lm')
+    print('BERTPretrain : inputs = {}'.format(inputs))
+    # outputs : (batch_size, n_enc_seq, embedding_dim)
+    # outputs_cls : (batch_size, embedding_dim)
+    # attn_probs : (batch_size, num_heads, n_enc_seq, n_enc_seq)
+    outputs, outputs_cls = BERT(config)(inputs, segments)
+
+    # (batch_size, 2)
+    # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
+    # A의 다음문장이 B가 맞을경우는 True, 아닐경우는 False로 예측
+    logits_cls = projection_cls(outputs_cls)
+
+    # (batch_size, n_enc_seq, n_enc_vocab)
+    # MLM 예측
+    logits_lm = projection_lm(outputs)
+
+    return Model(inputs=[inputs, segments], outputs=[logits_cls, logits_lm], name=name)
+
 
 class BERTPretrain(Layer):
     def __init__(self, config):
@@ -640,7 +651,7 @@ class Train:
         self.BATCH_SIZE = 64
         self.BUFFER_SIZE = 20000
 
-    def makeInnerModel(self, type="LEARN"):
+    def makeInnerModel(self, execType="LEARN"):
         """
         TODO:
         1. DataSet에서 batch 만들기.
@@ -661,7 +672,7 @@ class Train:
         # self.dataset = self.dataset.batch(self.BATCH_SIZE)
         # self.dataset = self.dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
-        if type == "TEST":
+        if execType == "TEST":
             print("makeModel : make instant input for forward pass")
             self.inputs = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1, maxval=vocab.vocab_size(),
                                             dtype=tf.dtypes.int32)
@@ -669,16 +680,18 @@ class Train:
                                               dtype=tf.dtypes.int32)
             # inputs = tf.constant(shape=(100, config.n_enc_seq), name="inputs")
             # segments = tf.constant(shape=(100, config.n_enc_seq), name="segments")
-        elif type == "LEARN":
+        elif execType == "LEARN":
             print("makeModel : make tensor input for learn")
             self.inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
             self.segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
 
         print('before make BERT network')
         try:
-            bert_layer = BERTPretrain(config)
             # 에러 : self.logits_cls, self.logits_lm 가 None으로 반환됨.
-            self.logits_cls, self.logits_lm = bert_layer(self.inputs, self.segments)
+            # bert_layer = BERTPretrain(config)
+            # self.logits_cls, self.logits_lm = bert_layer(self.inputs, self.segments)
+
+            self.logits_cls, self.logits_lm = bert_pretrain(config)([self.inputs, self.segments])
         except Exception as e:
             traceback.print_exc()
             print('error occured')

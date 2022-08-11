@@ -4,7 +4,7 @@ import sys
 import traceback
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
-from keras.losses import SparseCategoricalCrossentropy
+from keras.losses import SparseCategoricalCrossentropy, BinaryCrossentropy
 from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer, Embedding, concatenate
 from tensorflow.keras import Model, Input
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -14,6 +14,7 @@ import numpy as np
 from config import Config
 from tensorflow.keras import Sequential
 
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # CPU만 사용하기 위한 옵션
 #
 # import importlib
 #
@@ -36,7 +37,8 @@ def load_vocab():
 vocab = load_vocab()
 
 config = Config.load('config.json')
-config.update({"n_enc_vocab": vocab.vocab_size()})
+config.update({'n_enc_vocab': vocab.vocab_size()})
+print('config n_enc_vocab size = {}'.format(config.n_enc_vocab))
 
 
 def get_attn_pad_mask(seq_q, seq_k, i_pad):
@@ -60,25 +62,26 @@ def scaled_dot_product_attention(query, key, value, mask, num_heads, n_enc_seq):
     # print('scaled_dot_product_attention : query = {}'.format(query))
     # print('scaled_dot_product_attention : key = {}'.format(key))
     # print('scaled_dot_product_attention : value = {}'.format(value))
-    matmul_qk = tf.matmul(query, key, transpose_b=True)
+    matmul_qk = tf.matmul(query, key, transpose_b=True, output_type=tf.float32)
     depth = tf.cast(tf.shape(key)[-1], tf.float32)  # Head의 projection_dim
-    batch_size = tf.cast(tf.shape(key)[0], tf.float32)  # Head의 projection_dim
+    batch_size = tf.cast(tf.shape(key)[0], tf.int32)  # Head의 projection_dim
     logits = matmul_qk / tf.math.sqrt(depth)
-
     # 마스킹. 에턴션 스코어 행렬의 마스킹 할 위치에 매우 작은 음수값을 넣는다.
     # 매우 작은 값이므로 소프트맥스 함수를 지나면 행렬의 해당 위치의 값은 0이 됨.
     mask = tf.broadcast_to(tf.expand_dims(mask, axis=1),
                            [batch_size, num_heads, n_enc_seq, n_enc_seq])
-    print('scaled_dot_product_attention : logits shape = {}'.format(logits))
-    print('scaled_dot_product_attention : mask shape = {}'.format(mask))
+    # print('scaled_dot_product_attention : logits shape = {}'.format(logits))
+    # print('scaled_dot_product_attention : mask shape = {}'.format(mask))
 
     # if mask is not None:
     #     logits += (mask * -1e9)
     # 패딩마스크를 logits 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 -1e9으로 업데이트)
     # logits = tf.where(mask, -1e9, logits)
     # logits = tf.where(mask, tf.constant(-1e9, dtype=tf.dtypes.int32, shape=(tf.shape(logits))), logits)
-
     attention_weights = tf.nn.softmax(logits, axis=-1)
+    attention_weights = tf.cast(attention_weights, tf.float32)
+    # print('scaled_dot_product_attention : attention_weights shape = {}'.format(attention_weights))
+    # print('scaled_dot_product_attention : value type = {}'.format(value))
 
     # output 크기 : (batch_size, num_heads, query의 문장 길이, d_model/num_heads)
     output = tf.matmul(attention_weights, value)
@@ -182,17 +185,17 @@ class EncoderLayer(Layer):
 
 
 def encoder(config, name='encoder'):
-    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
-    segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+    inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.float32)
+    segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.float32)
     # 포지션 임베딩 inputs 생성 (크기는 inputs의 seq_length와 동일)
     positions = None
     if execType == "TEST":
         positions = tf.random.uniform(shape=(100, config.n_enc_seq), minval=1,
                                       maxval=config.n_enc_seq,
-                                      dtype=tf.dtypes.int32)
+                                      dtype=tf.dtypes.float32)
     elif execType == "LEARN":
         # positions = Input(shape=(config.n_enc_seq,), name="positions", dtype=tf.dtypes.int32)
-        positions = tf.constant([i+1 for i in range(config.n_enc_seq)])
+        positions = tf.constant([i + 1 for i in range(config.n_enc_seq)])
     print('encoder : positions shape = {}'.format(positions.shape))
     enc_emb = tf.keras.layers.Embedding(config.n_enc_vocab, config.embedding_dim, name='Encoder_enc_emb')
     # n_enc_seq에 +1 하는 이유가??
@@ -656,7 +659,7 @@ def makeDataset(vocab, in_file):
         with open(in_file_format, 'r') as f:
             for line in f:
                 line_cnt += 1
-
+        # line_cnt = 10  # 데이터수 10으로 줄이기
         with open(in_file_format, 'r') as f:
 
             for j, line in enumerate(tqdm(f, total=line_cnt, desc=f"Loading {in_file_format}", unit=" lines")):
@@ -692,7 +695,8 @@ def makeDataset(vocab, in_file):
     # sentences = tf.ragged.constant(sentences)
     # segments = tf.ragged.constant(segments)
     # labels_lm = tf.ragged.constant(labels_lm)
-    labels_cls = tf.expand_dims(labels_cls, axis=1)
+    # labels_cls = tf.expand_dims(labels_cls, axis=1)
+    labels_cls = np.expand_dims(labels_cls, axis=1)
     print("sentences : [{},{}]".format(sentences.shape[0], sentences.shape[1]))
     print("segments : [{},{}]".format(segments.shape[0], segments.shape[1]))
     print("labels_lm : [{},{}]".format(labels_lm.shape[0], labels_lm.shape[1]))
@@ -735,6 +739,15 @@ class Train:
         # config = Config.load("config.json")
         filepath = "../kowiki-data/kowiki_bert_{}.json"
         self.x, self.y = makeDataset(vocab, filepath)
+
+        print('dataset input_x={}, segments_x={}, logits_cls_y={}, logits_lm_y={}'.format(
+            self.x['inputs'][5], self.x['segments'][5], self.y['labels_cls'][5], self.y['labels_lm'][5]))
+        # print('dataset input_x={}, segments_x={}, logits_cls_y={}, logits_lm_y={}'.format(
+        #     type(self.x['inputs'][5][0]), type(self.x['segments'][5][0]), type(self.y['labels_cls'][5][0]),
+        #     type(self.y['labels_lm'][5][0])))
+        # print('dataset input_x={}, segments_x={}, logits_cls_y={}, logits_lm_y={}'.format(
+        #     type(self.x['inputs'][5]), type(self.x['segments'][5]), type(self.y['labels_cls'][5]),
+        #     type(self.y['labels_lm'][5])))
         # self.dataset = self.dataset.cache()
         # self.dataset = self.dataset.shuffle(buffer_size=self.BUFFER_SIZE)
         # self.dataset = self.dataset.batch(self.BATCH_SIZE)
@@ -750,8 +763,8 @@ class Train:
             # segments = tf.constant(shape=(100, config.n_enc_seq), name="segments")
         elif execType == "LEARN":
             print("makeModel : make tensor input for learn")
-            self.inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.int32)
-            self.segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
+            self.inputs = Input(shape=(config.n_enc_seq,), name="inputs", dtype=tf.dtypes.float32)
+            self.segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.float32)
 
         print('before make BERT network')
         try:
@@ -765,15 +778,26 @@ class Train:
             print('error occured')
 
         print('make bert layer : logits_cls = {}, logits_lm = {}'.format(self.logits_cls, self.logits_lm))
-        self.concat_output = concatenate([self.logits_cls, self.logits_lm])
-        print('concat_output shape = {}'.format(self.concat_output.shape))
+        # self.concat_output = concatenate([self.logits_cls, self.logits_lm])
+        # print('concat_output shape = {}'.format(self.concat_output.shape))
         print('after make BERT network')
 
     def learn(self):
-        self.model = CustomModel(inputs=[self.inputs, self.segments], outputs=self.concat_output)
-        self.model.compile(optimizer="adam", loss=SparseCategoricalCrossentropy, metrics=["accuracy"])
-        self.model.fit(x=[self.x['inputs'], self.x['segments']], y=[self.y['labels_cls'], self.y['labels_lm']],
+        self.model = CustomModel(inputs=[self.inputs, self.segments], outputs=[self.logits_cls, self.logits_lm])
+        self.model.compile(optimizer="adam", metrics=["accuracy"])
+        self.model.fit(x=[self.x['inputs'].astype(np.float32), self.x['segments'].astype(np.float32)],
+                       y=[self.y['labels_cls'].astype(np.float32), self.y['labels_lm'].astype(np.float32)],
                        batch_size=self.BATCH_SIZE, epochs=2)
+
+
+def sparse_categorical_crossentropy(y_true, y_pred):
+    sce = SparseCategoricalCrossentropy()
+    return sce(y_true, y_pred)
+
+
+def binary_cross_entropy(y_true, y_pred):
+    bce = BinaryCrossentropy()
+    return bce(y_true, y_pred)
 
 
 class CustomModel(tf.keras.Model):
@@ -783,20 +807,25 @@ class CustomModel(tf.keras.Model):
 
     def train_step(self, data):
         # Unpack the data. Its structure depends on your model and on what you pass to 'fit()'
-        print('train_step : data={}'.format(data.shape))
+        # print('train_step : data={}'.format(data))
         x, y = data
         inputs = x[0]
         segments = x[1]
         labels_cls = y[0]
         labels_lm = y[1]
+        # print('dataset input_x={}, segments_x={}, logits_cls_y={}, logits_lm_y={}'.format(
+        #     inputs, segments, labels_cls, labels_lm))
 
         with tf.GradientTape() as tape:
             y_pred = self([inputs, segments], training=True)  # Forward pass
             # Compute loss value
             logits_cls, logits_lm = y_pred[0], y_pred[1]
+            # print('y_pred[0]={}\ny_pred[1]={}'.format(y_pred[0], y_pred[1]))
             # loss_function은 model.compile단에서 정의
-            loss_cls = self.compiled_loss(labels_cls, logits_cls, regularization_losses=self.losses)
-            loss_lm = self.compiled_loss(labels_lm, logits_lm, regularization_losses=self.losses)
+            # loss_cls = self.compiled_loss(labels_cls, logits_cls, regularization_losses=self.losses)
+            # loss_lm = self.compiled_loss(labels_lm, logits_lm, regularization_losses=self.losses)
+            loss_cls = binary_cross_entropy(labels_cls, logits_cls)
+            loss_lm = sparse_categorical_crossentropy(labels_cls, logits_cls)
             loss = loss_cls + loss_lm
 
         # Compute gradients

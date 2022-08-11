@@ -10,6 +10,3 @@ class Config(dict):
         with open(file, 'r') as f:
             config = json.loads(f.read())
             return Config(config)
-
-    def update(self, update_dict, **kwargs):
-        dict.update(update_dict)

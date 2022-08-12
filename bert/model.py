@@ -5,13 +5,13 @@ import traceback
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
 from keras.losses import SparseCategoricalCrossentropy, BinaryCrossentropy
-from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer, Embedding, concatenate
+from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer
 from tensorflow.keras import Model, Input
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import sentencepiece as spm
 from tqdm import tqdm
 import numpy as np
-from config import Config
+from common.config import Config
 from tensorflow.keras import Sequential
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # CPU만 사용하기 위한 옵션

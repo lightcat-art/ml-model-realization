@@ -825,7 +825,7 @@ class CustomModel(tf.keras.Model):
             # loss_cls = self.compiled_loss(labels_cls, logits_cls, regularization_losses=self.losses)
             # loss_lm = self.compiled_loss(labels_lm, logits_lm, regularization_losses=self.losses)
             loss_cls = binary_cross_entropy(labels_cls, logits_cls)
-            loss_lm = sparse_categorical_crossentropy(labels_cls, logits_cls)
+            loss_lm = sparse_categorical_crossentropy(labels_lm, logits_lm)
             loss = loss_cls + loss_lm
 
         # Compute gradients

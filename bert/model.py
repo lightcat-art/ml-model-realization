@@ -76,8 +76,8 @@ def scaled_dot_product_attention(query, key, value, mask, num_heads, n_enc_seq):
     # if mask is not None:
     #     logits += (mask * -1e9)
     # 패딩마스크를 logits 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 -1e9으로 업데이트)
-    # logits = tf.where(mask, -1e9, logits)
-    # logits = tf.where(mask, tf.constant(-1e9, dtype=tf.dtypes.int32, shape=(tf.shape(logits))), logits)
+    logits = tf.where(mask, -1e9, logits)
+    # logits = tf.where(mask, tf.constant(-1e9, dtype=tf.dtypes.float32, shape=(tf.shape(logits))), logits)
     attention_weights = tf.nn.softmax(logits, axis=-1)
     attention_weights = tf.cast(attention_weights, tf.float32)
     # print('scaled_dot_product_attention : attention_weights shape = {}'.format(attention_weights))
@@ -208,7 +208,9 @@ def encoder(config, name='encoder'):
     print('Encoder : positions = {}'.format(positions))
     print('Encoder : pos_mask = {}'.format(pos_mask))
     # 패딩마스크를 positions 에 덮어씌우기. (패딩토큰이 아니라면 보존, 패딩토큰은 0으로 업데이트)
-    # positions = tf.where(pos_mask, tf.constant(0, dtype=tf.dtypes.int32, shape=(tf.shape(inputs))), positions)
+    print('Encoder : inputs shape = {}'.format(tf.shape(inputs)))
+    # positions = tf.where(pos_mask, tf.constant(0, dtype=tf.dtypes.float32, shape=(tf.shape(inputs))), positions)
+    positions = tf.where(pos_mask, 0, positions)
 
     # (batch_size, n_enc_seq, embedding_dim)
     outputs = enc_emb(inputs) + pos_emb(positions) + seg_emb(segments)

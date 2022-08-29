@@ -789,7 +789,22 @@ class Train:
         self.model.compile(optimizer="adam", metrics=["accuracy"])
         self.model.fit(x=[self.x['inputs'].astype(np.float32), self.x['segments'].astype(np.float32)],
                        y=[self.y['labels_cls'].astype(np.float32), self.y['labels_lm'].astype(np.float32)],
-                       batch_size=self.BATCH_SIZE, epochs=2)
+                       batch_size=self.BATCH_SIZE, epochs=1)
+
+    def predict(self):
+        input = '안녕하세요 반갑습니다. 무엇을 도와드릴까요?'
+        encode_input = vocab.encode_as_pieces(input)
+        print('predict : encode_input = {}'.format(encode_input))
+        encode_input_id = [vocab.piece_to_id(encode_input)]
+        print('predict : encode_input = {}'.format(encode_input_id))
+        sentences = pad_sequences(encode_input_id, maxlen=config.n_enc_seq, padding='post', value=0)
+        print('predict : pad encode_input = {}'.format(sentences))
+        segments = [0 for i in range(encode_input.index('.') + 1)]
+        segments.extend([1 for i in range(encode_input.index('.') + 1, len(encode_input))])
+        print('predict : segment = {}'.format(segments))
+        segments = pad_sequences([segments], maxlen=config.n_enc_seq, padding='post', value=0)
+        output_cls, output_lm = self.model.predict([sentences, segments])
+        print('predict : output_cls={}, output_lm={}'.format(output_cls, output_lm))
 
 
 def sparse_categorical_crossentropy(y_true, y_pred):
@@ -851,3 +866,4 @@ if __name__ == "__main__":
     if execType == "LEARN":
         train.makeInnerModel(execType)
         train.learn()
+        train.predict()

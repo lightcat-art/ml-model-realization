@@ -2,3 +2,6 @@
 *.bz2
 kowiki-data
 *.pyc
+dist
+build
+*.egg-info

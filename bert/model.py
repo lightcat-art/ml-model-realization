@@ -702,7 +702,15 @@ def makeDataset(vocab, in_file):
     print("sentences : [{},{}]".format(sentences.shape[0], sentences.shape[1]))
     print("segments : [{},{}]".format(segments.shape[0], segments.shape[1]))
     print("labels_lm : [{},{}]".format(labels_lm.shape[0], labels_lm.shape[1]))
-    print("labels_cls : {}".format(labels_cls))
+    print("labels_cls : [{},{}]".format(labels_cls.shape[0], labels_cls.shape[1]))
+
+    # 실제 라벨데이터를 one-hot-encoding으로 바꾸려니 OOM이 너무 쉽게 난다...
+    # loss 계산시에 인덱스 정보만 가지고 좀더 효율적으로 계산할순 없을까
+    # labels_lm = tf.one_hot(labels_lm, config.n_enc_vocab+1)
+    # labels_lm = tf.one_hot(labels_cls, 2)
+    #
+    # print("labels_lm : [{},{},{}]".format(labels_lm.shape[0], labels_lm.shape[1], labels_lm.shape[2]))
+    # print("labels_cls : [{},{},{}]".format(labels_cls.shape[0], labels_cls.shape[1], labels_cls.shape[2]))
 
     # dataset = tf.data.Dataset.from_tensor_slices(({'inputs': sentences, 'segments': segments},
     #                                               {'labels_cls': labels_cls, 'labels_lm': labels_lm}))
@@ -744,6 +752,7 @@ class Train:
 
         print('dataset input_x={}, segments_x={}, logits_cls_y={}, logits_lm_y={}'.format(
             self.x['inputs'][5], self.x['segments'][5], self.y['labels_cls'][5], self.y['labels_lm'][5]))
+
         # print('dataset input_x={}, segments_x={}, logits_cls_y={}, logits_lm_y={}'.format(
         #     type(self.x['inputs'][5][0]), type(self.x['segments'][5][0]), type(self.y['labels_cls'][5][0]),
         #     type(self.y['labels_lm'][5][0])))
@@ -789,7 +798,7 @@ class Train:
         self.model.compile(optimizer="adam", metrics=["accuracy"])
         self.model.fit(x=[self.x['inputs'].astype(np.float32), self.x['segments'].astype(np.float32)],
                        y=[self.y['labels_cls'].astype(np.float32), self.y['labels_lm'].astype(np.float32)],
-                       batch_size=self.BATCH_SIZE, epochs=1)
+                       batch_size=self.BATCH_SIZE, epochs=2)
 
     def predict(self):
         input = '안녕하세요 반갑습니다. 무엇을 도와드릴까요?'
@@ -803,17 +812,18 @@ class Train:
         segments.extend([1 for i in range(encode_input.index('.') + 1, len(encode_input))])
         print('predict : segment = {}'.format(segments))
         segments = pad_sequences([segments], maxlen=config.n_enc_seq, padding='post', value=0)
+        print('predict : pad segment = {}'.format(segments))
         output_cls, output_lm = self.model.predict([sentences, segments])
         print('predict : output_cls={}, output_lm={}'.format(output_cls, output_lm))
 
 
 def sparse_categorical_crossentropy(y_true, y_pred):
-    sce = SparseCategoricalCrossentropy()
+    sce = SparseCategoricalCrossentropy(name='mlm')
     return sce(y_true, y_pred)
 
 
 def binary_cross_entropy(y_true, y_pred):
-    bce = BinaryCrossentropy()
+    bce = BinaryCrossentropy(name='cls')
     return bce(y_true, y_pred)
 
 
@@ -841,8 +851,16 @@ class CustomModel(tf.keras.Model):
             # loss_function은 model.compile단에서 정의
             # loss_cls = self.compiled_loss(labels_cls, logits_cls, regularization_losses=self.losses)
             # loss_lm = self.compiled_loss(labels_lm, logits_lm, regularization_losses=self.losses)
+            print('labels_lm={} , logits_lm={}'.format(labels_lm, logits_lm))
+            print('labels_cls={} , logits_cls={}'.format(labels_cls, logits_cls))
+            labels_cls = tf.reshape(tf.one_hot(tf.cast(labels_cls, tf.int32), 2),shape=[-1,2])
+            labels_lm = tf.one_hot(tf.cast(labels_lm, tf.int32), config.n_enc_vocab)
+
+            print('one-hot : labels_lm={} , logits_lm={}'.format(labels_lm, logits_lm))
+            print('one-hot : labels_cls={} , logits_cls={}'.format(labels_cls, logits_cls))
             loss_cls = binary_cross_entropy(labels_cls, logits_cls)
             loss_lm = sparse_categorical_crossentropy(labels_lm, logits_lm)
+            # print('loss_cls={}, loss_lm={}'.format(loss_cls, loss_lm))
             loss = loss_cls + loss_lm
 
         # Compute gradients

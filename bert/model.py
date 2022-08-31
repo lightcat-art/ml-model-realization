@@ -4,7 +4,7 @@ import sys
 import traceback
 from random import shuffle, random, choice, randrange
 import tensorflow as tf
-from keras.losses import SparseCategoricalCrossentropy, BinaryCrossentropy
+from keras.losses import SparseCategoricalCrossentropy, BinaryCrossentropy, CategoricalCrossentropy
 from tensorflow.keras.layers import LayerNormalization, Dropout, Dense, Layer
 from tensorflow.keras import Model, Input
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -798,7 +798,7 @@ class Train:
         self.model.compile(optimizer="adam", metrics=["accuracy"])
         self.model.fit(x=[self.x['inputs'].astype(np.float32), self.x['segments'].astype(np.float32)],
                        y=[self.y['labels_cls'].astype(np.float32), self.y['labels_lm'].astype(np.float32)],
-                       batch_size=self.BATCH_SIZE, epochs=2)
+                       batch_size=self.BATCH_SIZE, epochs=100)
 
     def predict(self):
         input = '안녕하세요 반갑습니다. 무엇을 도와드릴까요?'
@@ -816,10 +816,23 @@ class Train:
         output_cls, output_lm = self.model.predict([sentences, segments])
         print('predict : output_cls={}, output_lm={}'.format(output_cls, output_lm))
 
+        output_lm_recon = []
+        for item in output_lm[0]:
+            # print('item={}'.format(item))
+            # 마스크 토큰은 여러개 생성될수있음, -1부근이 아닌 idx처럼 보이는 것들은 다 추출해야함.
+            output_lm_recon.append(list(item).index(max(item)))
+        print(output_lm_recon)
+        print(vocab.id_to_piece(output_lm_recon))
+
 
 def sparse_categorical_crossentropy(y_true, y_pred):
     sce = SparseCategoricalCrossentropy(name='mlm')
     return sce(y_true, y_pred)
+
+
+def categorical_crossentropy(y_true, y_pred):
+    ce = CategoricalCrossentropy(name='mlm')
+    return ce(y_true, y_pred)
 
 
 def binary_cross_entropy(y_true, y_pred):
@@ -853,13 +866,14 @@ class CustomModel(tf.keras.Model):
             # loss_lm = self.compiled_loss(labels_lm, logits_lm, regularization_losses=self.losses)
             print('labels_lm={} , logits_lm={}'.format(labels_lm, logits_lm))
             print('labels_cls={} , logits_cls={}'.format(labels_cls, logits_cls))
-            labels_cls = tf.reshape(tf.one_hot(tf.cast(labels_cls, tf.int32), 2),shape=[-1,2])
+            # lm loss 계산 시 sparse categorical crossentropy를 쓰면 내부 원핫인코딩시에 문제가 생기는듯..? predict가 nan으로 나옴.
+            # 그냥 직접 원핫인코딩 하고 categorical_crossentropy를 쓰기.
+            labels_cls = tf.reshape(tf.one_hot(tf.cast(labels_cls, tf.int32), 2), shape=[-1, 2])
+            loss_cls = binary_cross_entropy(labels_cls, logits_cls)
             labels_lm = tf.one_hot(tf.cast(labels_lm, tf.int32), config.n_enc_vocab)
-
+            loss_lm = categorical_crossentropy(labels_lm, logits_lm)
             print('one-hot : labels_lm={} , logits_lm={}'.format(labels_lm, logits_lm))
             print('one-hot : labels_cls={} , logits_cls={}'.format(labels_cls, logits_cls))
-            loss_cls = binary_cross_entropy(labels_cls, logits_cls)
-            loss_lm = sparse_categorical_crossentropy(labels_lm, logits_lm)
             # print('loss_cls={}, loss_lm={}'.format(loss_cls, loss_lm))
             loss = loss_cls + loss_lm
 

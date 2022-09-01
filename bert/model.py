@@ -35,6 +35,7 @@ def load_vocab():
 
 
 vocab = load_vocab()
+# print(vocab.IdToPiece(8006))
 
 config = Config.load('config.json')
 config.update({'n_enc_vocab': vocab.vocab_size()})
@@ -333,7 +334,7 @@ def bert_pretrain(config, name="bert_pretrain"):
     segments = Input(shape=(config.n_enc_seq,), name="segments", dtype=tf.dtypes.int32)
 
     projection_cls = Dense(units=2, name='bert_pretrain_projection_cls')
-    projection_lm = Dense(units=config.n_enc_vocab, name='bert_pretrain_projection_lm')
+    projection_lm = Dense(units=config.n_enc_vocab + 1, name='bert_pretrain_projection_lm')
     print('BERTPretrain : inputs = {}'.format(inputs))
     # outputs : (batch_size, n_enc_seq, embedding_dim)
     # outputs_cls : (batch_size, embedding_dim)
@@ -344,10 +345,12 @@ def bert_pretrain(config, name="bert_pretrain"):
     # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
     # A의 다음문장이 B가 맞을경우는 True, 아닐경우는 False로 예측
     logits_cls = projection_cls(outputs_cls)
+    logits_cls = tf.nn.softmax(logits_cls, axis=-1)
 
     # (batch_size, n_enc_seq, n_enc_vocab)
     # MLM 예측
     logits_lm = projection_lm(outputs)
+    logits_lm = tf.nn.softmax(logits_lm, axis=-1)
 
     return Model(inputs=[inputs, segments], outputs=[logits_cls, logits_lm], name=name)
 
@@ -673,7 +676,7 @@ def makeDataset(vocab, in_file):
                 mask_idx = np.array(instance["mask_idx"], dtype=np.int)  # tokens 내 mask index
                 # tokens 내 mask된 부분의 정답
                 mask_label = np.array([vocab.piece_to_id(p) for p in instance["mask_label"]], dtype=np.int)
-                label_lm = np.full(len(sentence), dtype=np.int, fill_value=-1)
+                label_lm = np.full(len(sentence), dtype=np.int, fill_value=vocab.vocab_size())
                 label_lm[mask_idx] = mask_label
                 labels_lm.append(label_lm)
         line_cnt = 0
@@ -795,34 +798,49 @@ class Train:
 
     def learn(self):
         self.model = CustomModel(inputs=[self.inputs, self.segments], outputs=[self.logits_cls, self.logits_lm])
-        self.model.compile(optimizer="adam", metrics=["accuracy"])
+        self.model.compile(optimizer="rmsprop", metrics=["accuracy"])
         self.model.fit(x=[self.x['inputs'].astype(np.float32), self.x['segments'].astype(np.float32)],
                        y=[self.y['labels_cls'].astype(np.float32), self.y['labels_lm'].astype(np.float32)],
-                       batch_size=self.BATCH_SIZE, epochs=100)
+                       batch_size=self.BATCH_SIZE, epochs=5)
 
     def predict(self):
-        input = '안녕하세요 반갑습니다. 무엇을 도와드릴까요?'
-        encode_input = vocab.encode_as_pieces(input)
-        print('predict : encode_input = {}'.format(encode_input))
-        encode_input_id = [vocab.piece_to_id(encode_input)]
-        print('predict : encode_input = {}'.format(encode_input_id))
-        sentences = pad_sequences(encode_input_id, maxlen=config.n_enc_seq, padding='post', value=0)
-        print('predict : pad encode_input = {}'.format(sentences))
-        segments = [0 for i in range(encode_input.index('.') + 1)]
-        segments.extend([1 for i in range(encode_input.index('.') + 1, len(encode_input))])
-        print('predict : segment = {}'.format(segments))
-        segments = pad_sequences([segments], maxlen=config.n_enc_seq, padding='post', value=0)
-        print('predict : pad segment = {}'.format(segments))
+        # input = '안녕하세요 반갑습니다. 무엇을 도와드릴까요?'
+        # encode_input = vocab.encode_as_pieces(input)
+        # print('predict : encode_input = {}'.format(encode_input))
+        # encode_input_id = [vocab.piece_to_id(encode_input)]
+        # print('predict : encode_input = {}'.format(encode_input_id))
+        # sentences = pad_sequences(encode_input_id, maxlen=config.n_enc_seq, padding='post', value=0)
+        # print('predict : pad encode_input = {}'.format(sentences))
+        # segments = [0 for i in range(encode_input.index('.') + 1)]
+        # segments.extend([1 for i in range(encode_input.index('.') + 1, len(encode_input))])
+        # print('predict : segment = {}'.format(segments))
+        # segments = pad_sequences([segments], maxlen=config.n_enc_seq, padding='post', value=0)
+        # print('predict : pad segment = {}'.format(segments))
+        sentences = self.x['inputs'][10:20].astype(np.float32)
+        segments = self.x['segments'][10:20].astype(np.float32)
+        labels_cls = self.y['labels_cls'][10:20].astype(np.float32)
+        labels_lm = self.y['labels_lm'][10:20].astype(np.float32)
         output_cls, output_lm = self.model.predict([sentences, segments])
         print('predict : output_cls={}, output_lm={}'.format(output_cls, output_lm))
+        # print('predict : labels_cls={}, labels_lm={}'.format(labels_cls, labels_lm))
 
-        output_lm_recon = []
-        for item in output_lm[0]:
-            # print('item={}'.format(item))
-            # 마스크 토큰은 여러개 생성될수있음, -1부근이 아닌 idx처럼 보이는 것들은 다 추출해야함.
-            output_lm_recon.append(list(item).index(max(item)))
-        print(output_lm_recon)
-        print(vocab.id_to_piece(output_lm_recon))
+        for sen_idx, output_item in enumerate(output_lm):
+            output_lm_recon = []
+            output_lm_recon_idx = []
+            for token_idx, item in enumerate(output_item):
+                # print('item={}'.format(item))
+                # 마스크 토큰은 여러개 생성될수있음, -1부근이 아닌 idx처럼 보이는 것들은 다 추출해야함.
+                # print('item = {}'.format(list(item)))
+                extract_idx = list(item).index(max(item))
+                if extract_idx != vocab.vocab_size() and sentences[sen_idx][token_idx] != 0:
+                    output_lm_recon.append(extract_idx)
+                    output_lm_recon_idx.append(token_idx)
+            print('sentences = ',sentences[sen_idx])
+            print('output mask_token = ',output_lm_recon)
+            print('output mask token info = ',vocab.id_to_piece(output_lm_recon))
+            print('output mask_token position = ',output_lm_recon_idx)
+            print('label mask token info = ', [idx for idx, item in enumerate(labels_lm[sen_idx]) if item != vocab.vocab_size()])
+            print('--------------------------------------------')
 
 
 def sparse_categorical_crossentropy(y_true, y_pred):
@@ -870,7 +888,8 @@ class CustomModel(tf.keras.Model):
             # 그냥 직접 원핫인코딩 하고 categorical_crossentropy를 쓰기.
             labels_cls = tf.reshape(tf.one_hot(tf.cast(labels_cls, tf.int32), 2), shape=[-1, 2])
             loss_cls = binary_cross_entropy(labels_cls, logits_cls)
-            labels_lm = tf.one_hot(tf.cast(labels_lm, tf.int32), config.n_enc_vocab)
+            # -1 을 vocab_size+1로 매핑함으로 인해 one_hot size도 +1
+            labels_lm = tf.one_hot(tf.cast(labels_lm, tf.int32), config.n_enc_vocab + 1)
             loss_lm = categorical_crossentropy(labels_lm, logits_lm)
             print('one-hot : labels_lm={} , logits_lm={}'.format(labels_lm, logits_lm))
             print('one-hot : labels_cls={} , logits_cls={}'.format(labels_cls, logits_cls))

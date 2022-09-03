@@ -695,7 +695,7 @@ def makeDataset(vocab, in_file):
 
     sentences = pad_sequences(sentences, maxlen=config.n_enc_seq, padding='post', value=0)
     segments = pad_sequences(segments, maxlen=config.n_enc_seq, padding='post', value=0)
-    labels_lm = pad_sequences(labels_lm, maxlen=config.n_enc_seq, padding='post', value=-1)
+    labels_lm = pad_sequences(labels_lm, maxlen=config.n_enc_seq, padding='post', value=vocab.vocab_size())
 
     # sentences = tf.ragged.constant(sentences)
     # segments = tf.ragged.constant(segments)
@@ -801,7 +801,7 @@ class Train:
         self.model.compile(optimizer="rmsprop", metrics=["accuracy"])
         self.model.fit(x=[self.x['inputs'].astype(np.float32), self.x['segments'].astype(np.float32)],
                        y=[self.y['labels_cls'].astype(np.float32), self.y['labels_lm'].astype(np.float32)],
-                       batch_size=self.BATCH_SIZE, epochs=5)
+                       batch_size=self.BATCH_SIZE, epochs=30)
 
     def predict(self):
         # input = '안녕하세요 반갑습니다. 무엇을 도와드릴까요?'
@@ -839,7 +839,8 @@ class Train:
             print('output mask_token = ',output_lm_recon)
             print('output mask token info = ',vocab.id_to_piece(output_lm_recon))
             print('output mask_token position = ',output_lm_recon_idx)
-            print('label mask token info = ', [idx for idx, item in enumerate(labels_lm[sen_idx]) if item != vocab.vocab_size()])
+            print('label mask token idx info = ', [idx for idx, item in enumerate(labels_lm[sen_idx]) if item != vocab.vocab_size()])
+            print('label mask token info = ', [vocab.id_to_piece(int(item)) for idx, item in enumerate(labels_lm[sen_idx]) if item != vocab.vocab_size()])
             print('--------------------------------------------')
 
 

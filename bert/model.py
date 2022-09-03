@@ -345,11 +345,13 @@ def bert_pretrain(config, name="bert_pretrain"):
     # cls토큰으로 문장 A와 문장 B의 관계를 예측 (NSP)
     # A의 다음문장이 B가 맞을경우는 True, 아닐경우는 False로 예측
     logits_cls = projection_cls(outputs_cls)
+    # 확률 예측을 위한 softmax 추가
     logits_cls = tf.nn.softmax(logits_cls, axis=-1)
 
     # (batch_size, n_enc_seq, n_enc_vocab)
     # MLM 예측
     logits_lm = projection_lm(outputs)
+    # 확률 예측을 위한 softmax 추가
     logits_lm = tf.nn.softmax(logits_lm, axis=-1)
 
     return Model(inputs=[inputs, segments], outputs=[logits_cls, logits_lm], name=name)
@@ -571,7 +573,7 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_li
     :param vocab:
     :param in_file:
     :param out_file:
-    :param count:
+    :param count: 한 말뭉치에 대해 Pretrain 데이터 n개(count로 설정가능) 생성 (MASK를 모두 다르게 생성)
     :param n_seq:
     :param mask_prob:
     :return:
@@ -588,7 +590,7 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_li
     line_cnt = 0
     with open(in_file, 'r', encoding='utf-8') as in_f:
         for line in in_f:
-            if max_line_cnt < line_cnt:
+            if max_line_cnt < line_cnt and max_line_cnt != -1:
                 break
             line_cnt += 1
     print("make_pretrain_data line cnt = {}".format(line_cnt))
@@ -611,25 +613,29 @@ def make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_li
                     if 0 < len(pieces):
                         doc.append(pieces)
                 pbar.update(1)
-            if doc:
-                docs.append(doc)
+        if doc:
+            docs.append(doc)
 
-        # BERT는 Mask를 15%만 하므로 MLM을 학습시에 한번에 전체 단어를 학습할수 없음.
-        # 한 말뭉치에 대해 통상 Pretrain 데이터 10개(count로 설정가능) 정도 만들어서 학습하도록 함.
-        for index in range(count):
-            output = out_file.format(index)
-            if os.path.isfile(output): continue
+    # BERT는 Mask를 15%만 하므로 MLM을 학습시에 한번에 전체 단어를 학습할수 없음.
+    # 한 말뭉치에 대해 통상 Pretrain 데이터 10개(count로 설정가능) 정도 만들어서 학습하도록 함.
+    for index in range(count):
+        output = out_file.format(index)
+        print('make file {} start'.format(output))
+        # 이미 파일이 있고, 덮어쓰기 설정이 되어있지 않은 경우에만 스킵
+        if os.path.isfile(output) and not config.overwrite_data:
+            continue
 
-            with open(output, 'w') as out_f:
-                with tqdm(total=len(docs), desc=f"Masking") as pbar:
-                    # 단락모음을 돌면서 모든 단락에 대해 Pretrain data를 생성하여 하나의 파일에 쓰기.
-                    for i, doc in enumerate(docs):
-                        # doc은 encode된 토큰(토큰의 인덱스가 아닌 토큰단어)으로 이루어짐.
-                        instances = create_pretrain_instances(docs, i, doc, n_seq, mask_prob, vocab_list)
-                        for instance in instances:
-                            out_f.write(json.dumps(instance))
-                            out_f.write("\n")
-                        pbar.update(1)
+        with open(output, 'w', encoding='utf-8') as out_f:
+            with tqdm(total=len(docs), desc=f"Making") as pbar:
+                # 단락모음을 돌면서 모든 단락에 대해 Pretrain data를 생성하여 하나의 파일에 쓰기.
+                for i, doc in enumerate(docs):
+                    # doc은 encode된 토큰(토큰의 인덱스가 아닌 토큰단어)으로 이루어짐.
+                    instances = create_pretrain_instances(docs, i, doc, n_seq, mask_prob, vocab_list)
+                    for instance in instances:
+                        out_f.write(json.dumps(instance))
+                        out_f.write("\n")
+                    pbar.update(1)
+        print('make file {} is complete'.format(output))
 
 
 def wrapper_make_pretrain_data():
@@ -640,7 +646,7 @@ def wrapper_make_pretrain_data():
     # kowiki 학습데이터를 살펴보니 단락이 꽤나 길어서 256개로는 데이터 뒷부분을 제대로 활용하기 힘들수도 있지만... 일단 적용
     n_seq = config.n_enc_seq  # 단락(문장) 최대길이.
     mask_prob = 0.15
-    make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_line_cnt=1000)
+    make_pretrain_data(vocab, in_file, out_file, count, n_seq, mask_prob, max_line_cnt=config.load_max_line_cnt)
 
 
 def makeDataset(vocab, in_file):

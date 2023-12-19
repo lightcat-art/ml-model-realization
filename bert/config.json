@@ -1,12 +1,14 @@
 {
-    "embedding_dim": 512,
+    "embedding_dim": 128,
     "num_heads": 8,
-    "dff": 3072,
+    "dff": 512,
     "dropout": 0.1,
     "epsilon": 1e-12,
     "n_enc_vocab": 20000,
-    "n_enc_seq": 256,
+    "n_enc_seq": 128,
     "n_seg_type": 2,
     "i_pad": 0,
-    "n_layer": 12
+    "n_layer": 3,
+    "load_max_line_cnt" : 5000,
+    "overwrite_data" : true
 }

@@ -25,7 +25,7 @@ def get_requirements(path='requirements.txt'):
 
 
 name = 'ml-model-realization'
-option = 'all'
+option = 'source'
 
 if option == 'all':
     setup(
